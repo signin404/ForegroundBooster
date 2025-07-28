@@ -42,19 +42,33 @@ DWORD lastProcessId = 0;
 
 // --- 函数定义 ---
 
+// *** 关键变更：可靠的字符串到宽字符串转换函数 ***
+std::wstring string_to_wstring(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
 void ParseIniFile(const std::wstring& path) {
     printf("[Config] Attempting to load INI file from: %ws\n", path.c_str());
-    std::wifstream file(path);
+    
+    // *** 关键变更：使用窄字符流 ifstream，避免自动编码转换 ***
+    std::ifstream file(path);
     if (!file.is_open()) {
         printf("[Config] ERROR: Could not open INI file. Using default settings.\n");
         return;
     }
     printf("[Config] Successfully opened INI file.\n");
     
-    file.imbue(std::locale(""));
-    std::wstring line, currentSection;
+    std::string narrow_line; // 读取为窄字符串
+    std::wstring currentSection;
     
-    while (std::getline(file, line)) {
+    while (std::getline(file, narrow_line)) {
+        // 手动将读取的行从 UTF-8 转换为宽字符串
+        std::wstring line = string_to_wstring(narrow_line);
+
         if (!line.empty() && line.back() == L'\r') line.pop_back();
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
 

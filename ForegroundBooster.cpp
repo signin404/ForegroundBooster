@@ -172,35 +172,46 @@ void ForegroundBoosterThread() {
         }
 
         if (currentProcessId != lastProcessId) {
+            // --- 1. 恢复上一个进程 ---
             if (lastProcessId != 0) {
                 HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
                 if (hOldProcess) {
+                    // 检查是否存在已记录的原始优先级，如果存在则恢复
                     if (originalIoPriorities.count(lastProcessId)) {
                         SetProcessIoPriority(hOldProcess, originalIoPriorities[lastProcessId]);
                         originalIoPriorities.erase(lastProcessId);
                     }
                     CloseHandle(hOldProcess);
                 }
+                // 释放上一个进程的 Job Object
                 ReleaseJobObject(lastProcessId);
             }
 
+            // --- 2. 处理新的前台进程 ---
             if (currentProcessId != 0) {
                 std::wstring processName = GetProcessNameById(currentProcessId);
                 if (!processName.empty() && !blackList.count(processName)) {
                     HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | SYNCHRONIZE, FALSE, currentProcessId);
                     if (hNewProcess) {
+                        // *** CHANGED: 检查并仅在原始优先级为 "Normal" 时提升 ***
                         IO_PRIORITY_HINT currentPriority;
-                        if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority < IoPriorityHigh) {
+                        if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority == IoPriorityNormal) {
+                            // 记录原始优先级，以便之后恢复
                             originalIoPriorities[currentProcessId] = currentPriority;
+                            // 将优先级提升为 "High"
                             SetProcessIoPriority(hNewProcess, IoPriorityHigh);
                         }
 
-                        HANDLE hJob = CreateJobObject(NULL, NULL);
+                        // *** CHANGED: 创建命名的 Job Object ***
+                        std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
+                        HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
+
                         if (hJob) {
                             if (AssignProcessToJobObject(hJob, hNewProcess)) {
                                 managedJobs[currentProcessId] = hJob;
                                 ApplyJobObjectSettings(hJob, processName);
                             } else {
+                                // 如果分配失败（例如，进程已在另一个Job中），则关闭我们刚创建的句柄
                                 CloseHandle(hJob);
                             }
                         }

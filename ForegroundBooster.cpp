@@ -9,7 +9,7 @@
 #include <set>
 #include <fstream>
 #include <sstream>
-#includeinclude <processthreadsapi.h>
+#include <processthreadsapi.h> // <--- 已修正此处的打字错误
 #include <locale>
 #include <cstdio> 
 #include <algorithm> 
@@ -34,7 +34,7 @@ using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
 // --- 全局配置变量 ---
 struct Settings {
     int dwmInterval = 60; int foregroundInterval = 2; int dscp = -1;
-    int scheduling = -1; int weight = -1; int processListInterval = 10; // 新增设置
+    int scheduling = -1; int weight = -1; int processListInterval = 10;
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
@@ -42,8 +42,8 @@ std::map<DWORD, HANDLE> managedJobs;
 std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
 DWORD lastAttachedThreadId = 0;
-std::set<DWORD> previousPids; // 用于进程列表比较
-int timeAccumulator = 0; // 用于进程列表检查计时
+std::set<DWORD> previousPids;
+int timeAccumulator = 0;
 
 // --- 函数定义 ---
 
@@ -86,7 +86,7 @@ void ParseIniFile(const std::wstring& path) {
                     else if (key == L"DSCP") settings.dscp = std::stoi(value);
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
-                    else if (key == L"ProcessList") settings.processListInterval = std::stoi(value); // 新增
+                    else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
                 }
             } else if (currentSection == L"BlackList") {
                 blackList.insert(to_lower(line));
@@ -180,7 +180,6 @@ void ResetAndReleaseJobObject(DWORD processId) {
     }
 }
 
-// --- 新增：后台I/O优先级重置功能 ---
 void CheckAndResetIoPriorities() {
     printf("[后台检查] 正在检查进程列表变化...\n");
     std::set<DWORD> currentPids;
@@ -211,7 +210,7 @@ void CheckAndResetIoPriorities() {
             std::wstring processNameLower = to_lower(pe32.szExeFile);
 
             if (pid == lastProcessId || blackList.count(processNameLower)) {
-                continue; // 跳过当前前台进程和黑名单进程
+                continue;
             }
 
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, pid);
@@ -229,12 +228,11 @@ void CheckAndResetIoPriorities() {
         } while (Process32NextW(hSnapshot, &pe32));
     }
     CloseHandle(hSnapshot);
-    previousPids = currentPids; // 更新基准列表
+    previousPids = currentPids;
 }
 
 void ForegroundBoosterThread() {
     while (true) {
-        // --- 前台进程处理逻辑 ---
         HWND foregroundWindow = GetForegroundWindow();
         DWORD currentProcessId = 0;
         DWORD currentThreadId = 0;
@@ -271,7 +269,6 @@ void ForegroundBoosterThread() {
                             printf("  -> I/O优先级已提升为“高”。\n");
                         }
                         
-                        // *** 关键变更：仅当不在 BlackListJob 中时才创建 Job Object ***
                         if (!blackListJob.count(processNameLower)) {
                             std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
                             HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
@@ -305,7 +302,6 @@ void ForegroundBoosterThread() {
             lastProcessId = currentProcessId;
         }
 
-        // --- 附加线程逻辑 ---
         if (currentThreadId != 0 && currentThreadId != lastAttachedThreadId) {
             printf("[附加线程] 检测到新的前台线程ID: %lu\n", currentThreadId);
             std::vector<DWORD> threadsToAttach;
@@ -357,11 +353,10 @@ void ForegroundBoosterThread() {
             lastAttachedThreadId = currentThreadId;
         }
 
-        // --- 后台I/O重置逻辑计时器 ---
         timeAccumulator += settings.foregroundInterval;
         if (timeAccumulator >= settings.processListInterval) {
             CheckAndResetIoPriorities();
-            timeAccumulator = 0; // 重置计时器
+            timeAccumulator = 0;
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));

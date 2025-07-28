@@ -1,5 +1,6 @@
 #include <iostream>
 #include <windows.h>
+#include <winnt.h> // 显式包含以获取 Job Object 定义
 #include <string>
 #include <vector>
 #include <thread>
@@ -8,54 +9,18 @@
 #include <set>
 #include <fstream>
 #include <sstream>
+#include <processthreadsapi.h> // 用于 QueryFullProcessImageNameW
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
 
-// --- Windows Native API 定義 ---
-
-// I/O 優先級
-typedef enum _PROCESS_INFORMATION_CLASS {
-    ProcessIoPriority = 33
-} PROCESS_INFORMATION_CLASS;
-
-typedef enum _IO_PRIORITY_HINT {
-    IoPriorityVeryLow = 0,
-    IoPriorityLow = 1,
-    IoPriorityNormal = 2,
-    IoPriorityHigh = 3,
-    IoPriorityCritical = 4,
-    MaxIoPriorityTypes
-} IO_PRIORITY_HINT;
-
-// Job Object
-typedef enum _JOB_OBJECT_INFO_CLASS {
-    JobObjectBasicLimitInformation = 2,
-    JobObjectCpuRateControlInformation = 15,
-    JobObjectNetRateControlInformation = 32
-} JOB_OBJECT_INFO_CLASS;
-
-// 從 powershell 腳本中獲取 JOBOBJECT_CPU_RATE_CONTROL_INFORMATION 的定義
-// 注意：原腳本中 Weight 是 uint，但在 C++ 中，結構體偏移量需要匹配，此處爲了簡化直接使用
-// 原始結構體應當在 64 位系統上對齊
-#pragma pack(push, 4)
-typedef struct _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
-    DWORD ControlFlags;
-    DWORD Weight;
-} JOBOBJECT_CPU_RATE_CONTROL_INFORMATION;
-#pragma pack(pop)
-
-typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
-    DWORD64 MaxBandwidth;
-    DWORD ControlFlags;
-    BYTE DscpTag;
-} JOBOBJECT_NET_RATE_CONTROL_INFORMATION;
-
-// 函數指針
+// --- Windows Native API 函数指针 ---
+// 我们对 ntdll.dll 中的函数使用函数指针
 using NtSetInformationProcessPtr = NTSTATUS(NTAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, PVOID, ULONG);
+using NtQueryInformationProcessPtr = NTSTATUS(NTAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
 
-// --- 全局配置變量 ---
+// --- 全局配置变量 ---
 struct Settings {
     int dwmInterval = 60;
     int foregroundInterval = 2;
@@ -69,48 +34,55 @@ std::set<std::wstring> blackList;
 std::set<std::wstring> whiteList;
 std::set<std::wstring> blackListJob;
 std::map<DWORD, HANDLE> managedJobs;
-IO_PRIORITY_HINT originalIoPriority;
+
+// 用于存储原始优先级以便恢复的 Map
+std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
 
 // --- INI 文件解析 ---
 void ParseIniFile(const std::wstring& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return;
+    std::wifstream file(path); // 使用 wifstream 处理宽字符串
+    if (!file.is_open()) {
+        return; // 如果找不到 INI 文件则静默返回
+    }
 
-    std::string line;
-    std::string currentSection;
+    file.imbue(std::locale("")); // 处理不同的文本编码
+
+    std::wstring line;
+    std::wstring currentSection;
 
     while (std::getline(file, line)) {
-        if (line.empty() || line[0] == ';') continue;
-        if (line[0] == '[' && line.back() == ']') {
+        // 清理空白字符和回车
+        line.erase(0, line.find_first_not_of(L" \t\r\n"));
+        line.erase(line.find_last_not_of(L" \t\r\n") + 1);
+
+        if (line.empty() || line[0] == L';') continue;
+
+        if (line[0] == L'[' && line.back() == L']') {
             currentSection = line.substr(1, line.size() - 2);
         } else {
-            std::stringstream ss(line);
-            std::string key, value;
-            if (std::getline(ss, key, '=') && std::getline(ss, value)) {
-                if (currentSection == "Settings") {
-                    if (key == "DwmEnableMMCSS") settings.dwmInterval = std::stoi(value);
-                    if (key == "Foreground") settings.foregroundInterval = std::stoi(value);
-                    if (key == "DSCP") settings.dscp = std::stoi(value);
-                    if (key == "Scheduling") settings.scheduling = std::stoi(value);
-                    if (key == "Weight") settings.weight = std::stoi(value);
-                } else {
-                    // 對於名單，鍵就是值，兼容每行一個的格式
-                    std::wstring wideKey(line.begin(), line.end());
-                    if (currentSection == "BlackList") blackList.insert(wideKey);
-                    if (currentSection == "WhiteList") whiteList.insert(wideKey);
-                    if (currentSection == "BlackListJob") blackListJob.insert(wideKey);
+            if (currentSection == L"Settings") {
+                std::wstringstream ss(line);
+                std::wstring key, value;
+                if (std::getline(ss, key, L'=') && std::getline(ss, value)) {
+                    if (key == L"DwmEnableMMCSS") settings.dwmInterval = std::stoi(value);
+                    else if (key == L"Foreground") settings.foregroundInterval = std::stoi(value);
+                    else if (key == L"DSCP") settings.dscp = std::stoi(value);
+                    else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
+                    else if (key == L"Weight") settings.weight = std::stoi(value);
                 }
+            } else if (currentSection == L"BlackList") {
+                blackList.insert(line);
+            } else if (currentSection == L"WhiteList") {
+                whiteList.insert(line);
+            } else if (currentSection == L"BlackListJob") {
+                blackListJob.insert(line);
             }
         }
     }
 }
 
-// --- 核心功能函數 ---
-
-HANDLE GetProcessHandleById(DWORD processId) {
-    return OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA | PROCESS_VM_READ, FALSE, processId);
-}
+// --- 核心功能函数 ---
 
 std::wstring GetProcessNameById(DWORD processId) {
     HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
@@ -128,16 +100,25 @@ std::wstring GetProcessNameById(DWORD processId) {
 }
 
 void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
-    NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+    static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
     if (NtSetInformationProcess) {
         NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
     }
 }
 
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
+    static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    if (NtQueryInformationProcess) {
+        ULONG returnLength;
+        NTSTATUS status = NtQueryInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority), &returnLength);
+        return NT_SUCCESS(status);
+    }
+    return false;
+}
+
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     if (blackListJob.count(processName)) return;
 
-    // 設置調度優先級
     if (settings.scheduling >= 0 && settings.scheduling <= 9) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
@@ -145,7 +126,6 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
     }
     
-    // 設置時間片權重
     if (settings.weight >= 1 && settings.weight <= 9) {
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
@@ -153,7 +133,6 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
     }
 
-    // 設置 DSCP
     if (settings.dscp >= 0 && settings.dscp <= 63) {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
@@ -169,63 +148,60 @@ void ReleaseJobObject(DWORD processId) {
     }
 }
 
-void AttachThreadsToForeground(DWORD foregroundThreadId) {
-    // 由於實現複雜且需要枚舉所有進程和線程，此處簡化為概念性代碼
-    // 一個完整的實現需要枚舉白名單進程的所有線程ID
-    // 此處僅爲演示邏輯
-}
-
-
 void ForegroundBoosterThread() {
-    DWORD lastAttachedThreadId = 0;
-
     while (true) {
         HWND foregroundWindow = GetForegroundWindow();
+        DWORD currentProcessId = 0;
         if (foregroundWindow) {
-            DWORD currentProcessId;
-            DWORD currentThreadId = GetWindowThreadProcessId(foregroundWindow, &currentProcessId);
+            GetWindowThreadProcessId(foregroundWindow, &currentProcessId);
+        }
 
-            if (currentProcessId != lastProcessId) {
-                // 1. 恢復上一個進程
-                if (lastProcessId != 0) {
-                    HANDLE hOldProcess = GetProcessHandleById(lastProcessId);
-                    if (hOldProcess) {
-                        SetProcessIoPriority(hOldProcess, originalIoPriority);
-                        CloseHandle(hOldProcess);
+        if (currentProcessId != lastProcessId) {
+            // 1. 恢复上一个进程
+            if (lastProcessId != 0) {
+                HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
+                if (hOldProcess) {
+                    if (originalIoPriorities.count(lastProcessId)) {
+                        SetProcessIoPriority(hOldProcess, originalIoPriorities[lastProcessId]);
+                        originalIoPriorities.erase(lastProcessId);
                     }
-                    ReleaseJobObject(lastProcessId);
+                    CloseHandle(hOldProcess);
                 }
+                // 始终释放 Job Object
+                ReleaseJobObject(lastProcessId);
+            }
 
-                // 2. 處理新進程
+            // 2. 处理新进程
+            if (currentProcessId != 0) {
                 std::wstring processName = GetProcessNameById(currentProcessId);
                 if (!processName.empty() && !blackList.count(processName)) {
-                    HANDLE hNewProcess = GetProcessHandleById(currentProcessId);
+                    HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | SYNCHRONIZE, FALSE, currentProcessId);
                     if (hNewProcess) {
-                        originalIoPriority = IoPriorityNormal; // 默認值
-                        // (爲了簡化，省略了查詢原始優先級的步驟)
-                        
-                        SetProcessIoPriority(hNewProcess, IoPriorityHigh);
+                        IO_PRIORITY_HINT currentPriority;
+                        if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority < IoPriorityHigh) {
+                            originalIoPriorities[currentProcessId] = currentPriority;
+                            SetProcessIoPriority(hNewProcess, IoPriorityHigh);
+                        }
 
                         HANDLE hJob = CreateJobObject(NULL, NULL);
                         if (hJob) {
-                            managedJobs[currentProcessId] = hJob;
-                            AssignProcessToJobObject(hJob, hNewProcess);
-                            ApplyJobObjectSettings(hJob, processName);
+                            if (AssignProcessToJobObject(hJob, hNewProcess)) {
+                                managedJobs[currentProcessId] = hJob;
+                                ApplyJobObjectSettings(hJob, processName);
+                            } else {
+                                CloseHandle(hJob);
+                            }
                         }
                         CloseHandle(hNewProcess);
                     }
                 }
-                lastProcessId = currentProcessId;
             }
-
-            // 處理線程附加
-            if (currentThreadId != lastAttachedThreadId) {
-                 // 在此處實現 AttachThreadInput 邏輯
-                 // 首先分離之前附加的線程
-                 // 然後將白名單進程的線程附加到新的 currentThreadId
-                lastAttachedThreadId = currentThreadId;
-            }
+            lastProcessId = currentProcessId;
         }
+        
+        // 线程附加逻辑 (此处为占位符)
+        // ...
+
         std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
     }
 }
@@ -244,14 +220,16 @@ void DwmThread() {
         DwmEnableMMCSS(TRUE);
         std::this_thread::sleep_for(std::chrono::seconds(settings.dwmInterval));
     }
-    // FreeLibrary(dwmapi); // 理論上不會執行到這裡
 }
 
 int main() {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring path(exePath);
-    path = path.substr(0, path.find_last_of(L"."));
+    size_t lastDot = path.find_last_of(L".");
+    if (lastDot != std::wstring::npos) {
+        path = path.substr(0, lastDot);
+    }
     path += L".ini";
 
     ParseIniFile(path);

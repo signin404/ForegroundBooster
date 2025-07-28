@@ -161,7 +161,10 @@ void ForegroundBoosterThread() {
                 std::wstring processName = GetProcessNameById(currentProcessId);
                 if (!processName.empty() && !blackList.count(processName)) {
                     printf("  -> Process name: %ws is not in blacklist.\n", processName.c_str());
-                    HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | SYNCHRONIZE, FALSE, currentProcessId);
+                    
+                    // *** 关键变更：添加了 AssignProcessToJobObject 所需的 PROCESS_TERMINATE 权限 ***
+                    HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
+                    
                     if (hNewProcess) {
                         IO_PRIORITY_HINT currentPriority;
                         if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority == IoPriorityNormal) {
@@ -178,7 +181,7 @@ void ForegroundBoosterThread() {
                                 managedJobs[currentProcessId] = hJob;
                                 ApplyJobObjectSettings(hJob, processName);
                             } else {
-                                printf("  -> FAILED to assign process to Job Object. Error code: %lu\n", GetLastError());
+                                printf("  -> FAILED to assign process to Job Object. Error code: %lu (Process may already be in another job).\n", GetLastError());
                                 CloseHandle(hJob);
                             }
                         } else {
@@ -186,7 +189,12 @@ void ForegroundBoosterThread() {
                         }
                         CloseHandle(hNewProcess);
                     } else {
-                        printf("  -> FAILED to open process. Error code: %lu\n", GetLastError());
+                        DWORD lastError = GetLastError();
+                        if (lastError == 5) {
+                            printf("  -> FAILED to open process handle (Error 5: Access Denied). This can happen with protected processes.\n");
+                        } else {
+                            printf("  -> FAILED to open process. Error code: %lu\n", lastError);
+                        }
                     }
                 }
             }

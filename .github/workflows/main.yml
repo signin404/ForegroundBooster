@@ -12,20 +12,16 @@ jobs:
 
     steps:
     - name: Checkout repository
-      # 更新到 v4
       uses: actions/checkout@v4
 
-    - name: Set up MSVC
-      # 更新到 v2
-      uses: microsoft/setup-msvc@v2
-
     - name: Compile Application
+      # 直接调用 Visual Studio 的环境脚本，然后编译
       run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
         cl.exe /EHsc /O2 /W3 /Fe:ForegroundBooster.exe ForegroundBooster.cpp dwmapi.lib ntdll.lib user32.lib kernel32.lib
       shell: cmd
 
     - name: Upload Artifact
-      # 更新到 v4
       uses: actions/upload-artifact@v4
       with:
         name: ForegroundBooster

@@ -9,11 +9,11 @@
 #include <set>
 #include <fstream>
 #include <sstream>
-#include <processthreadsapi.h>
+#includeinclude <processthreadsapi.h>
 #include <locale>
 #include <cstdio> 
-#include <algorithm> // for std::transform
-#include <tlhelp32.h> // for CreateToolhelp32Snapshot
+#include <algorithm> 
+#include <tlhelp32.h> 
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -34,18 +34,19 @@ using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
 // --- 全局配置变量 ---
 struct Settings {
     int dwmInterval = 60; int foregroundInterval = 2; int dscp = -1;
-    int scheduling = -1; int weight = -1;
+    int scheduling = -1; int weight = -1; int processListInterval = 10; // 新增设置
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
 std::map<DWORD, HANDLE> managedJobs;
 std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
-DWORD lastAttachedThreadId = 0; // 用于附加线程功能
+DWORD lastAttachedThreadId = 0;
+std::set<DWORD> previousPids; // 用于进程列表比较
+int timeAccumulator = 0; // 用于进程列表检查计时
 
 // --- 函数定义 ---
 
-// 将宽字符串转换为小写
 std::wstring to_lower(std::wstring str) {
     std::transform(str.begin(), str.end(), str.begin(), ::towlower);
     return str;
@@ -85,6 +86,7 @@ void ParseIniFile(const std::wstring& path) {
                     else if (key == L"DSCP") settings.dscp = std::stoi(value);
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
+                    else if (key == L"ProcessList") settings.processListInterval = std::stoi(value); // 新增
                 }
             } else if (currentSection == L"BlackList") {
                 blackList.insert(to_lower(line));
@@ -129,10 +131,6 @@ bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
 
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     printf("  -> 正在应用作业对象设置...\n");
-    if (blackListJob.count(processName)) {
-        printf("     - 进程位于作业对象黑名单中，跳过设置。\n");
-        return;
-    }
     if (settings.scheduling >= 0) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
@@ -182,8 +180,61 @@ void ResetAndReleaseJobObject(DWORD processId) {
     }
 }
 
+// --- 新增：后台I/O优先级重置功能 ---
+void CheckAndResetIoPriorities() {
+    printf("[后台检查] 正在检查进程列表变化...\n");
+    std::set<DWORD> currentPids;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            currentPids.insert(pe32.th32ProcessID);
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+
+    if (currentPids == previousPids) {
+        printf("[后台检查] 进程列表无变化。\n");
+        return;
+    }
+
+    printf("[后台检查] 检测到进程列表变化！正在扫描所有进程的I/O优先级...\n");
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            DWORD pid = pe32.th32ProcessID;
+            std::wstring processNameLower = to_lower(pe32.szExeFile);
+
+            if (pid == lastProcessId || blackList.count(processNameLower)) {
+                continue; // 跳过当前前台进程和黑名单进程
+            }
+
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, pid);
+            if (!hProcess) continue;
+
+            DWORD priorityClass = GetPriorityClass(hProcess);
+            if (priorityClass == NORMAL_PRIORITY_CLASS || priorityClass == IDLE_PRIORITY_CLASS || priorityClass == BELOW_NORMAL_PRIORITY_CLASS) {
+                IO_PRIORITY_HINT ioPriority;
+                if (GetProcessIoPriority(hProcess, ioPriority) && ioPriority == IoPriorityHigh) {
+                    printf("  -> 重置进程 %ws (PID: %lu) 的I/O优先级为“正常”。\n", processNameLower.c_str(), pid);
+                    SetProcessIoPriority(hProcess, IoPriorityNormal);
+                }
+            }
+            CloseHandle(hProcess);
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
+    previousPids = currentPids; // 更新基准列表
+}
+
 void ForegroundBoosterThread() {
     while (true) {
+        // --- 前台进程处理逻辑 ---
         HWND foregroundWindow = GetForegroundWindow();
         DWORD currentProcessId = 0;
         DWORD currentThreadId = 0;
@@ -219,20 +270,26 @@ void ForegroundBoosterThread() {
                             SetProcessIoPriority(hNewProcess, IoPriorityHigh);
                             printf("  -> I/O优先级已提升为“高”。\n");
                         }
-                        std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
-                        HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
-                        if (hJob) {
-                            printf("  -> 已创建作业对象: %ws\n", jobName.c_str());
-                            ApplyJobObjectSettings(hJob, processNameLower);
-                            if (AssignProcessToJobObject(hJob, hNewProcess)) {
-                                printf("  -> 成功将进程分配到已配置的作业对象。\n");
-                                managedJobs[currentProcessId] = hJob;
+                        
+                        // *** 关键变更：仅当不在 BlackListJob 中时才创建 Job Object ***
+                        if (!blackListJob.count(processNameLower)) {
+                            std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
+                            HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
+                            if (hJob) {
+                                printf("  -> 已创建作业对象: %ws\n", jobName.c_str());
+                                ApplyJobObjectSettings(hJob, processNameLower);
+                                if (AssignProcessToJobObject(hJob, hNewProcess)) {
+                                    printf("  -> 成功将进程分配到已配置的作业对象。\n");
+                                    managedJobs[currentProcessId] = hJob;
+                                } else {
+                                    printf("  -> 失败: 无法将进程分配到作业对象。错误码: %lu (进程可能已在另一个作业中)。\n", GetLastError());
+                                    CloseHandle(hJob);
+                                }
                             } else {
-                                printf("  -> 失败: 无法将进程分配到作业对象。错误码: %lu (进程可能已在另一个作业中)。\n", GetLastError());
-                                CloseHandle(hJob);
+                                printf("  -> 失败: 无法创建作业对象。错误码: %lu\n", GetLastError());
                             }
                         } else {
-                            printf("  -> 失败: 无法创建作业对象。错误码: %lu\n", GetLastError());
+                            printf("  -> 进程位于作业对象黑名单中，跳过Job Object操作。\n");
                         }
                         CloseHandle(hNewProcess);
                     } else {
@@ -259,14 +316,18 @@ void ForegroundBoosterThread() {
                 if (Process32FirstW(hSnapshot, &pe32)) {
                     do {
                         if (whiteList.count(to_lower(pe32.szExeFile))) {
-                            THREADENTRY32 te32;
-                            te32.dwSize = sizeof(THREADENTRY32);
-                            if (Thread32First(hSnapshot, &te32)) {
-                                do {
-                                    if (te32.th32OwnerProcessID == pe32.th32ProcessID) {
-                                        threadsToAttach.push_back(te32.th32ThreadID);
-                                    }
-                                } while (Thread32Next(hSnapshot, &te32));
+                            HANDLE hThreadSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                            if(hThreadSnapshot != INVALID_HANDLE_VALUE){
+                                THREADENTRY32 te32;
+                                te32.dwSize = sizeof(THREADENTRY32);
+                                if (Thread32First(hThreadSnapshot, &te32)) {
+                                    do {
+                                        if (te32.th32OwnerProcessID == pe32.th32ProcessID) {
+                                            threadsToAttach.push_back(te32.th32ThreadID);
+                                        }
+                                    } while (Thread32Next(hThreadSnapshot, &te32));
+                                }
+                                CloseHandle(hThreadSnapshot);
                             }
                         }
                     } while (Process32NextW(hSnapshot, &pe32));
@@ -295,6 +356,14 @@ void ForegroundBoosterThread() {
             }
             lastAttachedThreadId = currentThreadId;
         }
+
+        // --- 后台I/O重置逻辑计时器 ---
+        timeAccumulator += settings.foregroundInterval;
+        if (timeAccumulator >= settings.processListInterval) {
+            CheckAndResetIoPriorities();
+            timeAccumulator = 0; // 重置计时器
+        }
+
         std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
     }
 }
@@ -313,7 +382,6 @@ void DwmThread() {
 int main() {
     AllocConsole();
     FILE* f;
-    // 设置控制台输出为 UTF-8 编码，以正确显示中文
     SetConsoleOutputCP(65001);
     freopen_s(&f, "CONOUT$", "w", stdout);
     

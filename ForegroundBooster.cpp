@@ -100,25 +100,45 @@ bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
     return false;
 }
 
+// *** 关键变更：为每个设置添加了详细的成功/失败日志 ***
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
-    if (blackListJob.count(processName)) return;
+    printf("  -> Applying Job Object settings...\n");
+    if (blackListJob.count(processName)) {
+        printf("     - Process is in Job blacklist. Skipping settings.\n");
+        return;
+    }
+
     if (settings.scheduling >= 0) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
         basicInfo.SchedulingClass = settings.scheduling;
-        SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
+        if (SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
+            printf("     - OK: Scheduling Class set to %d.\n", settings.scheduling);
+        } else {
+            printf("     - FAILED: Could not set Scheduling Class. Error: %lu\n", GetLastError());
+        }
     }
+    
     if (settings.weight >= 1) {
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
         cpuInfo.Weight = settings.weight;
-        SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
+        if (SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
+            printf("     - OK: Quantum Weight set to %d.\n", settings.weight);
+        } else {
+            printf("     - FAILED: Could not set Quantum Weight. Error: %lu\n", GetLastError());
+        }
     }
+
     if (settings.dscp >= 0) {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
         netInfo.DscpTag = (BYTE)settings.dscp;
-        SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
+        if (SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
+            printf("     - OK: DSCP Tag set to %d.\n", settings.dscp);
+        } else {
+            printf("     - FAILED: Could not set DSCP Tag. Error: %lu\n", GetLastError());
+        }
     }
 }
 
@@ -162,7 +182,6 @@ void ForegroundBoosterThread() {
                 if (!processName.empty() && !blackList.count(processName)) {
                     printf("  -> Process name: %ws is not in blacklist.\n", processName.c_str());
                     
-                    // *** 关键变更：添加了 AssignProcessToJobObject 所需的 PROCESS_TERMINATE 权限 ***
                     HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
                     
                     if (hNewProcess) {
@@ -172,17 +191,22 @@ void ForegroundBoosterThread() {
                             SetProcessIoPriority(hNewProcess, IoPriorityHigh);
                             printf("  -> I/O priority elevated to High.\n");
                         }
+                        
                         std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
                         HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
+                        
                         if (hJob) {
                             printf("  -> Created Job Object: %ws\n", jobName.c_str());
+                            
+                            // *** 关键变更：先配置 Job，再分配进程 ***
+                            ApplyJobObjectSettings(hJob, processName);
+                            
                             if (AssignProcessToJobObject(hJob, hNewProcess)) {
-                                printf("  -> Successfully assigned process to Job Object.\n");
+                                printf("  -> Successfully assigned process to configured Job Object.\n");
                                 managedJobs[currentProcessId] = hJob;
-                                ApplyJobObjectSettings(hJob, processName);
                             } else {
                                 printf("  -> FAILED to assign process to Job Object. Error code: %lu (Process may already be in another job).\n", GetLastError());
-                                CloseHandle(hJob);
+                                CloseHandle(hJob); // 清理未使用的 Job Object
                             }
                         } else {
                             printf("  -> FAILED to create Job Object. Error code: %lu\n", GetLastError());

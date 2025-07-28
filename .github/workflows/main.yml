@@ -12,10 +12,12 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      # 更新到 v4
+      uses: actions/checkout@v4
 
     - name: Set up MSVC
-      uses: microsoft/setup-msvc@v1.1
+      # 更新到 v2
+      uses: microsoft/setup-msvc@v2
 
     - name: Compile Application
       run: |
@@ -23,7 +25,8 @@ jobs:
       shell: cmd
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      # 更新到 v4
+      uses: actions/upload-artifact@v4
       with:
         name: ForegroundBooster
         path: ForegroundBooster.exe

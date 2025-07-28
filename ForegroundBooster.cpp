@@ -9,14 +9,25 @@
 #include <set>
 #include <fstream>
 #include <sstream>
-#include <processthreadsapi.h> // <--- 已修正此处的打字错误
+#include <processthreadsapi.h>
 #include <locale>
 #include <cstdio> 
 #include <algorithm> 
 #include <tlhelp32.h> 
+#include <cstdarg> // For va_list
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
+
+// --- 全局变量与常量 ---
+#define COLOR_INFO      11  // 青色
+#define COLOR_SUCCESS   10  // 绿色
+#define COLOR_WARNING   14  // 黄色
+#define COLOR_ERROR     12  // 红色
+#define COLOR_DEFAULT   7   // 白色/灰色
+
+HANDLE g_hConsole;
+bool g_silentMode = false;
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -45,7 +56,25 @@ DWORD lastAttachedThreadId = 0;
 std::set<DWORD> previousPids;
 int timeAccumulator = 0;
 
-// --- 函数定义 ---
+// --- 日志与函数定义 ---
+
+void Log(const char* format, ...) {
+    if (g_silentMode) return;
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+}
+
+void LogColor(WORD color, const char* format, ...) {
+    if (g_silentMode) return;
+    SetConsoleTextAttribute(g_hConsole, color);
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
+}
 
 std::wstring to_lower(std::wstring str) {
     std::transform(str.begin(), str.end(), str.begin(), ::towlower);
@@ -61,13 +90,13 @@ std::wstring string_to_wstring(const std::string& str) {
 }
 
 void ParseIniFile(const std::wstring& path) {
-    printf("[配置] 正在尝试从以下路径加载INI文件: %ws\n", path.c_str());
+    LogColor(COLOR_INFO, "[配置] 正在尝试从以下路径加载INI文件: %ws\n", path.c_str());
     std::ifstream file(path);
     if (!file.is_open()) {
-        printf("[配置] 错误: 无法打开INI文件。将使用默认设置。\n");
+        LogColor(COLOR_ERROR, "[配置] 错误: 无法打开INI文件。将使用默认设置。\n");
         return;
     }
-    printf("[配置] 成功打开INI文件。\n");
+    LogColor(COLOR_SUCCESS, "[配置] 成功打开INI文件。\n");
     std::string narrow_line;
     std::wstring currentSection;
     while (std::getline(file, narrow_line)) {
@@ -130,15 +159,15 @@ bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
 }
 
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
-    printf("  -> 正在应用作业对象设置...\n");
+    LogColor(COLOR_WARNING, "  -> 正在应用作业对象设置...\n");
     if (settings.scheduling >= 0) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
         basicInfo.SchedulingClass = settings.scheduling;
         if (SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
-            printf("     - 成功: 调度类已设置为 %d。\n", settings.scheduling);
+            LogColor(COLOR_SUCCESS, "     - 成功: 调度类已设置为 %d。\n", settings.scheduling);
         } else {
-            printf("     - 失败: 无法设置调度类。错误码: %lu\n", GetLastError());
+            LogColor(COLOR_ERROR, "     - 失败: 无法设置调度类。错误码: %lu\n", GetLastError());
         }
     }
     if (settings.weight >= 1) {
@@ -146,9 +175,9 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
         cpuInfo.Weight = settings.weight;
         if (SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
-            printf("     - 成功: 时间片权重已设置为 %d。\n", settings.weight);
+            LogColor(COLOR_SUCCESS, "     - 成功: 时间片权重已设置为 %d。\n", settings.weight);
         } else {
-            printf("     - 失败: 无法设置时间片权重。错误码: %lu\n", GetLastError());
+            LogColor(COLOR_ERROR, "     - 失败: 无法设置时间片权重。错误码: %lu\n", GetLastError());
         }
     }
     if (settings.dscp >= 0) {
@@ -156,9 +185,9 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         netInfo.ControlFlags = JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
         netInfo.DscpTag = (BYTE)settings.dscp;
         if (SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
-            printf("     - 成功: DSCP标记已设置为 %d。\n", settings.dscp);
+            LogColor(COLOR_SUCCESS, "     - 成功: DSCP标记已设置为 %d。\n", settings.dscp);
         } else {
-            printf("     - 失败: 无法设置DSCP标记。错误码: %lu\n", GetLastError());
+            LogColor(COLOR_ERROR, "     - 失败: 无法设置DSCP标记。错误码: %lu\n", GetLastError());
         }
     }
 }
@@ -166,7 +195,7 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
 void ResetAndReleaseJobObject(DWORD processId) {
     if (managedJobs.count(processId)) {
         HANDLE hJob = managedJobs[processId];
-        printf("  -> 正在为进程ID %lu 重置作业对象设置...\n", processId);
+        LogColor(COLOR_WARNING, "  -> 正在为进程ID %lu 重置作业对象设置...\n", processId);
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
@@ -174,14 +203,14 @@ void ResetAndReleaseJobObject(DWORD processId) {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = (JOB_OBJECT_NET_RATE_CONTROL_FLAGS)0;
         SetInformationJobObject(hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
-        printf("  -> 正在为进程ID %lu 关闭句柄并释放作业对象...\n", processId);
+        LogColor(COLOR_WARNING, "  -> 正在为进程ID %lu 关闭句柄并释放作业对象...\n", processId);
         CloseHandle(hJob);
         managedJobs.erase(processId);
     }
 }
 
 void CheckAndResetIoPriorities() {
-    printf("[后台检查] 正在检查进程列表变化...\n");
+    LogColor(COLOR_INFO, "[后台检查] 正在检查进程列表变化...\n");
     std::set<DWORD> currentPids;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return;
@@ -196,11 +225,10 @@ void CheckAndResetIoPriorities() {
     CloseHandle(hSnapshot);
 
     if (currentPids == previousPids) {
-        printf("[后台检查] 进程列表无变化。\n");
         return;
     }
 
-    printf("[后台检查] 检测到进程列表变化！正在扫描所有进程的I/O优先级...\n");
+    LogColor(COLOR_WARNING, "[后台检查] 检测到进程列表变化！正在扫描所有进程的I/O优先级...\n");
     hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
@@ -220,7 +248,7 @@ void CheckAndResetIoPriorities() {
             if (priorityClass == NORMAL_PRIORITY_CLASS || priorityClass == IDLE_PRIORITY_CLASS || priorityClass == BELOW_NORMAL_PRIORITY_CLASS) {
                 IO_PRIORITY_HINT ioPriority;
                 if (GetProcessIoPriority(hProcess, ioPriority) && ioPriority == IoPriorityHigh) {
-                    printf("  -> 重置进程 %ws (PID: %lu) 的I/O优先级为“正常”。\n", processNameLower.c_str(), pid);
+                    LogColor(COLOR_WARNING, "  -> 重置进程 %ws (PID: %lu) 的I/O优先级为“正常”。\n", processNameLower.c_str(), pid);
                     SetProcessIoPriority(hProcess, IoPriorityNormal);
                 }
             }
@@ -242,11 +270,11 @@ void ForegroundBoosterThread() {
 
         if (currentProcessId != lastProcessId) {
             if (lastProcessId != 0) {
-                printf("前台进程已变更 (原PID: %lu)\n", lastProcessId);
+                Log("前台进程已变更 (原PID: %lu)\n", lastProcessId);
                 HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
                 if (hOldProcess) {
                     if (originalIoPriorities.count(lastProcessId)) {
-                        printf("  -> 正在为进程ID %lu 恢复I/O优先级为“正常”。\n", lastProcessId);
+                        LogColor(COLOR_WARNING, "  -> 正在为进程ID %lu 恢复I/O优先级为“正常”。\n", lastProcessId);
                         SetProcessIoPriority(hOldProcess, originalIoPriorities[lastProcessId]);
                         originalIoPriorities.erase(lastProcessId);
                     }
@@ -256,45 +284,45 @@ void ForegroundBoosterThread() {
             }
 
             if (currentProcessId != 0) {
-                printf("新的前台进程PID: %lu\n", currentProcessId);
+                Log("新的前台进程PID: %lu\n", currentProcessId);
                 std::wstring processNameLower = to_lower(GetProcessNameById(currentProcessId));
                 if (!processNameLower.empty() && !blackList.count(processNameLower)) {
-                    printf("  -> 进程名: %ws (不在黑名单中)。\n", processNameLower.c_str());
+                    Log("  -> 进程名: %ws (不在黑名单中)。\n", processNameLower.c_str());
                     HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
                     if (hNewProcess) {
                         IO_PRIORITY_HINT currentPriority;
                         if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority == IoPriorityNormal) {
                             originalIoPriorities[currentProcessId] = currentPriority;
                             SetProcessIoPriority(hNewProcess, IoPriorityHigh);
-                            printf("  -> I/O优先级已提升为“高”。\n");
+                            LogColor(COLOR_SUCCESS, "  -> I/O优先级已提升为“高”。\n");
                         }
                         
                         if (!blackListJob.count(processNameLower)) {
                             std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
                             HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
                             if (hJob) {
-                                printf("  -> 已创建作业对象: %ws\n", jobName.c_str());
+                                Log("  -> 已创建作业对象: %ws\n", jobName.c_str());
                                 ApplyJobObjectSettings(hJob, processNameLower);
                                 if (AssignProcessToJobObject(hJob, hNewProcess)) {
-                                    printf("  -> 成功将进程分配到已配置的作业对象。\n");
+                                    LogColor(COLOR_SUCCESS, "  -> 成功将进程分配到已配置的作业对象。\n");
                                     managedJobs[currentProcessId] = hJob;
                                 } else {
-                                    printf("  -> 失败: 无法将进程分配到作业对象。错误码: %lu (进程可能已在另一个作业中)。\n", GetLastError());
+                                    LogColor(COLOR_ERROR, "  -> 失败: 无法将进程分配到作业对象。错误码: %lu (进程可能已在另一个作业中)。\n", GetLastError());
                                     CloseHandle(hJob);
                                 }
                             } else {
-                                printf("  -> 失败: 无法创建作业对象。错误码: %lu\n", GetLastError());
+                                LogColor(COLOR_ERROR, "  -> 失败: 无法创建作业对象。错误码: %lu\n", GetLastError());
                             }
                         } else {
-                            printf("  -> 进程位于作业对象黑名单中，跳过Job Object操作。\n");
+                            LogColor(COLOR_WARNING, "  -> 进程位于作业对象黑名单中，跳过Job Object操作。\n");
                         }
                         CloseHandle(hNewProcess);
                     } else {
                         DWORD lastError = GetLastError();
                         if (lastError == 5) {
-                            printf("  -> 失败: 打开进程句柄时被拒绝访问(错误码 5)。这通常发生在受保护的进程(如浏览器、反作弊程序)上，将跳过。\n");
+                            LogColor(COLOR_ERROR, "  -> 失败: 打开进程句柄时被拒绝访问(错误码 5)。这通常发生在受保护的进程(如浏览器、反作弊程序)上，将跳过。\n");
                         } else {
-                            printf("  -> 失败: 无法打开进程。错误码: %lu\n", lastError);
+                            LogColor(COLOR_ERROR, "  -> 失败: 无法打开进程。错误码: %lu\n", lastError);
                         }
                     }
                 }
@@ -303,9 +331,9 @@ void ForegroundBoosterThread() {
         }
 
         if (currentThreadId != 0 && currentThreadId != lastAttachedThreadId) {
-            printf("[附加线程] 检测到新的前台线程ID: %lu\n", currentThreadId);
+            LogColor(COLOR_INFO, "[附加线程] 检测到新的前台线程ID: %lu\n", currentThreadId);
             std::vector<DWORD> threadsToAttach;
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS | TH32CS_SNAPTHREAD, 0);
+            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot != INVALID_HANDLE_VALUE) {
                 PROCESSENTRY32W pe32;
                 pe32.dwSize = sizeof(PROCESSENTRY32W);
@@ -333,21 +361,21 @@ void ForegroundBoosterThread() {
 
             if (!threadsToAttach.empty()) {
                 if (lastAttachedThreadId != 0) {
-                    printf("  -> 正在从旧的前台线程 %lu 分离 %zu 个白名单线程...\n", lastAttachedThreadId, threadsToAttach.size());
+                    LogColor(COLOR_WARNING, "  -> 正在从旧的前台线程 %lu 分离 %zu 个白名单线程...\n", lastAttachedThreadId, threadsToAttach.size());
                     for (DWORD tid : threadsToAttach) {
                         AttachThreadInput(tid, lastAttachedThreadId, FALSE);
                     }
                 }
                 std::wstring currentProcessNameLower = to_lower(GetProcessNameById(currentProcessId));
                 if (!whiteList.count(currentProcessNameLower)) {
-                    printf("  -> 正在尝试将 %zu 个白名单线程附加到新的前台线程 %lu...\n", threadsToAttach.size(), currentThreadId);
+                    LogColor(COLOR_WARNING, "  -> 正在尝试将 %zu 个白名单线程附加到新的前台线程 %lu...\n", threadsToAttach.size(), currentThreadId);
                     int successCount = 0;
                     for (DWORD tid : threadsToAttach) {
                         if (AttachThreadInput(tid, currentThreadId, TRUE)) {
                             successCount++;
                         }
                     }
-                    printf("  -> 附加完成: %d / %zu 个线程成功。\n", successCount, threadsToAttach.size());
+                    LogColor(COLOR_SUCCESS, "  -> 附加完成: %d / %zu 个线程成功。\n", successCount, threadsToAttach.size());
                 }
             }
             lastAttachedThreadId = currentThreadId;
@@ -374,11 +402,18 @@ void DwmThread() {
     }
 }
 
-int main() {
-    AllocConsole();
-    FILE* f;
-    SetConsoleOutputCP(65001);
-    freopen_s(&f, "CONOUT$", "w", stdout);
+int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "-hide") {
+        g_silentMode = true;
+    }
+
+    if (!g_silentMode) {
+        AllocConsole();
+        FILE* f;
+        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleOutputCP(65001);
+        freopen_s(&f, "CONOUT$", "w", stdout);
+    }
     
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
@@ -389,7 +424,7 @@ int main() {
     
     ParseIniFile(path);
     
-    printf("--- 主循环已启动 ---\n");
+    LogColor(COLOR_INFO, "--- 主循环已启动 ---\n");
     
     std::thread t1(ForegroundBoosterThread);
     std::thread t2(DwmThread);

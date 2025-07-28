@@ -53,47 +53,34 @@ std::wstring string_to_wstring(const std::string& str) {
 
 void ParseIniFile(const std::wstring& path) {
     printf("[Config] Attempting to load INI file from: %ws\n", path.c_str());
-    
-    // *** 关键变更：使用窄字符流 ifstream，避免自动编码转换 ***
     std::ifstream file(path);
     if (!file.is_open()) {
         printf("[Config] ERROR: Could not open INI file. Using default settings.\n");
         return;
     }
     printf("[Config] Successfully opened INI file.\n");
-    
-    std::string narrow_line; // 读取为窄字符串
+    std::string narrow_line;
     std::wstring currentSection;
-    
     while (std::getline(file, narrow_line)) {
-        // 手动将读取的行从 UTF-8 转换为宽字符串
         std::wstring line = string_to_wstring(narrow_line);
-
         if (!line.empty() && line.back() == L'\r') line.pop_back();
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
-
         if (line[0] == L'[' && line.back() == L']') {
             currentSection = line.substr(1, line.size() - 2);
-            printf("[Config] Switched to section: [%ws]\n", currentSection.c_str());
         } else {
             if (currentSection == L"Settings") {
                 std::wstringstream ss(line);
                 std::wstring key, value;
                 if (std::getline(ss, key, L'=') && std::getline(ss, value)) {
-                    printf("[Config] Found setting: %ws = %ws\n", key.c_str(), value.c_str());
                     if (key == L"DwmEnableMMCSS") settings.dwmInterval = std::stoi(value);
                     else if (key == L"Foreground") settings.foregroundInterval = std::stoi(value);
                     else if (key == L"DSCP") settings.dscp = std::stoi(value);
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
                 }
-            } else if (currentSection == L"BlackList") {
-                blackList.insert(line);
-            } else if (currentSection == L"WhiteList") {
-                whiteList.insert(line);
-            } else if (currentSection == L"BlackListJob") {
-                blackListJob.insert(line);
-            }
+            } else if (currentSection == L"BlackList") blackList.insert(line);
+            else if (currentSection == L"WhiteList") whiteList.insert(line);
+            else if (currentSection == L"BlackListJob") blackListJob.insert(line);
         }
     }
     printf("[Config] Finished parsing INI file.\n");
@@ -139,40 +126,42 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
         basicInfo.SchedulingClass = settings.scheduling;
-        if (SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
-            printf("     - OK: Scheduling Class set to %d.\n", settings.scheduling);
-        } else {
-            printf("     - FAILED: Could not set Scheduling Class. Error: %lu\n", GetLastError());
-        }
+        SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
     }
     if (settings.weight >= 1) {
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
         cpuInfo.Weight = settings.weight;
-        if (SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
-            printf("     - OK: Quantum Weight set to %d.\n", settings.weight);
-        } else {
-            printf("     - FAILED: Could not set Quantum Weight. Error: %lu\n", GetLastError());
-        }
+        SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
     }
     if (settings.dscp >= 0) {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
         netInfo.DscpTag = (BYTE)settings.dscp;
-        if (SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
-            printf("     - OK: DSCP Tag set to %d.\n", settings.dscp);
-        } else {
-            printf("     - FAILED: Could not set DSCP Tag. Error: %lu\n", GetLastError());
-        }
+        SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
     }
 }
 
-void ReleaseJobObject(DWORD processId) {
-    if (managedJobs.count(processId)) {
-        CloseHandle(managedJobs[processId]);
-        managedJobs.erase(processId);
-    }
+// *** 新增函数：用于撤销/禁用Job Object的设置 ***
+void RevertJobObjectSettings(HANDLE jobHandle) {
+    printf("  -> Reverting Job Object settings to default...\n");
+    
+    // 禁用调度类
+    JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
+    basicInfo.LimitFlags = 0; // 传入0来清除标志
+    SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
+
+    // 禁用CPU权重
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
+    cpuInfo.ControlFlags = 0; // 传入0来禁用控制
+    SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
+
+    // 禁用DSCP
+    JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
+    netInfo.ControlFlags = 0; // 传入0来禁用控制
+    SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
 }
+
 
 void ForegroundBoosterThread() {
     while (true) {
@@ -181,6 +170,7 @@ void ForegroundBoosterThread() {
         if (foregroundWindow) GetWindowThreadProcessId(foregroundWindow, &currentProcessId);
 
         if (currentProcessId != lastProcessId) {
+            // --- 1. 恢复上一个进程 ---
             if (lastProcessId != 0) {
                 printf("Foreground changed from PID: %lu\n", lastProcessId);
                 HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
@@ -192,49 +182,65 @@ void ForegroundBoosterThread() {
                     }
                     CloseHandle(hOldProcess);
                 }
-                ReleaseJobObject(lastProcessId);
-                printf("  -> Released Job Object for PID: %lu\n", lastProcessId);
+                
+                // *** 关键变更：不再关闭句柄，而是撤销设置 ***
+                if (managedJobs.count(lastProcessId)) {
+                    RevertJobObjectSettings(managedJobs[lastProcessId]);
+                }
             }
 
+            // --- 2. 处理新的前台进程 ---
             if (currentProcessId != 0) {
                 printf("New foreground process PID: %lu\n", currentProcessId);
                 std::wstring processName = GetProcessNameById(currentProcessId);
                 if (!processName.empty() && !blackList.count(processName)) {
                     printf("  -> Process name: %ws is not in blacklist.\n", processName.c_str());
                     
-                    HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
-                    
-                    if (hNewProcess) {
-                        IO_PRIORITY_HINT currentPriority;
-                        if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority == IoPriorityNormal) {
-                            originalIoPriorities[currentProcessId] = currentPriority;
-                            SetProcessIoPriority(hNewProcess, IoPriorityHigh);
-                            printf("  -> I/O priority elevated to High.\n");
-                        }
-                        
-                        std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
-                        HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
-                        
-                        if (hJob) {
-                            printf("  -> Created Job Object: %ws\n", jobName.c_str());
-                            ApplyJobObjectSettings(hJob, processName);
-                            if (AssignProcessToJobObject(hJob, hNewProcess)) {
-                                printf("  -> Successfully assigned process to configured Job Object.\n");
-                                managedJobs[currentProcessId] = hJob;
-                            } else {
-                                printf("  -> FAILED to assign process to Job Object. Error code: %lu (Process may already be in another job).\n", GetLastError());
-                                CloseHandle(hJob);
-                            }
-                        } else {
-                            printf("  -> FAILED to create Job Object. Error code: %lu\n", GetLastError());
-                        }
-                        CloseHandle(hNewProcess);
+                    HANDLE hJob = NULL;
+
+                    // *** 关键变更：检查是否已为此进程创建过Job Object ***
+                    if (managedJobs.count(currentProcessId)) {
+                        printf("  -> Found existing Job Object for this process. Reusing.\n");
+                        hJob = managedJobs[currentProcessId];
                     } else {
-                        DWORD lastError = GetLastError();
-                        if (lastError == 5) {
-                            printf("  -> FAILED to open process handle (Error 5: Access Denied). This can happen with protected processes.\n");
+                        // 如果是第一次遇到此进程，则创建并分配
+                        printf("  -> First time seeing this process. Creating new Job Object.\n");
+                        HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
+                        if (hNewProcess) {
+                            std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
+                            hJob = CreateJobObjectW(NULL, jobName.c_str());
+                            if (hJob) {
+                                if (AssignProcessToJobObject(hJob, hNewProcess)) {
+                                    printf("  -> Successfully assigned process to Job Object.\n");
+                                    managedJobs[currentProcessId] = hJob; // 保存句柄以备后用
+                                } else {
+                                    printf("  -> FAILED to assign process to Job Object. Error: %lu\n", GetLastError());
+                                    CloseHandle(hJob);
+                                    hJob = NULL; // 标记为失败
+                                }
+                            } else {
+                                printf("  -> FAILED to create Job Object. Error: %lu\n", GetLastError());
+                            }
+                            CloseHandle(hNewProcess);
                         } else {
-                            printf("  -> FAILED to open process. Error code: %lu\n", lastError);
+                             printf("  -> FAILED to open process handle. Error: %lu\n", GetLastError());
+                        }
+                    }
+
+                    // 无论Job是新建的还是复用的，都应用前台设置
+                    if (hJob) {
+                        ApplyJobObjectSettings(hJob, processName);
+                        
+                        // 仅在需要时提升I/O优先级
+                        HANDLE hProcessForIo = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, currentProcessId);
+                        if(hProcessForIo) {
+                            IO_PRIORITY_HINT currentPriority;
+                            if (GetProcessIoPriority(hProcessForIo, currentPriority) && currentPriority == IoPriorityNormal) {
+                                originalIoPriorities[currentProcessId] = currentPriority;
+                                SetProcessIoPriority(hProcessForIo, IoPriorityHigh);
+                                printf("  -> I/O priority elevated to High.\n");
+                            }
+                            CloseHandle(hProcessForIo);
                         }
                     }
                 }

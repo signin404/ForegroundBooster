@@ -40,74 +40,62 @@ std::map<DWORD, HANDLE> managedJobs;
 std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
 
-// --- INI 文件解析 ---
+// --- INI 文件解析 (已添加详细诊断日志) ---
 void ParseIniFile(const std::wstring& path) {
+    printf("[Config] Attempting to load INI file from: %ws\n", path.c_str());
     std::wifstream file(path);
-    if (!file.is_open()) return;
+    if (!file.is_open()) {
+        printf("[Config] ERROR: Could not open INI file. Using default settings.\n");
+        return;
+    }
+    printf("[Config] Successfully opened INI file.\n");
+    
     file.imbue(std::locale(""));
     std::wstring line, currentSection;
+    
     while (std::getline(file, line)) {
         if (!line.empty() && line.back() == L'\r') line.pop_back();
         if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+
         if (line[0] == L'[' && line.back() == L']') {
             currentSection = line.substr(1, line.size() - 2);
+            printf("[Config] Switched to section: [%ws]\n", currentSection.c_str());
         } else {
             if (currentSection == L"Settings") {
                 std::wstringstream ss(line);
                 std::wstring key, value;
                 if (std::getline(ss, key, L'=') && std::getline(ss, value)) {
+                    printf("[Config] Found setting: %ws = %ws\n", key.c_str(), value.c_str());
                     if (key == L"DwmEnableMMCSS") settings.dwmInterval = std::stoi(value);
                     else if (key == L"Foreground") settings.foregroundInterval = std::stoi(value);
                     else if (key == L"DSCP") settings.dscp = std::stoi(value);
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
                 }
-            } else if (currentSection == L"BlackList") blackList.insert(line);
-            else if (currentSection == L"WhiteList") whiteList.insert(line);
-            else if (currentSection == L"BlackListJob") blackListJob.insert(line);
+            } else if (currentSection == L"BlackList") {
+                blackList.insert(line);
+            } else if (currentSection == L"WhiteList") {
+                whiteList.insert(line);
+            } else if (currentSection == L"BlackListJob") {
+                blackListJob.insert(line);
+            }
         }
     }
+    printf("[Config] Finished parsing INI file.\n");
 }
 
-// --- 核心功能函数 ---
-std::wstring GetProcessNameById(DWORD processId) {
-    HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
-    if (handle) {
-        wchar_t buffer[MAX_PATH];
-        DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameW(handle, 0, buffer, &size)) {
-            CloseHandle(handle);
-            std::wstring fullPath(buffer);
-            return fullPath.substr(fullPath.find_last_of(L"\\/") + 1);
-        }
-        CloseHandle(handle);
-    }
-    return L"";
-}
+// --- 核心功能函数 (与上一版相同) ---
+std::wstring GetProcessNameById(DWORD processId) { /* ... */ }
+void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) { /* ... */ }
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) { /* ... */ }
+void ReleaseJobObject(DWORD processId) { /* ... */ }
 
-void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
-    static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
-    if (NtSetInformationProcess) NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
-}
-
-bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
-    static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
-    if (NtQueryInformationProcess) {
-        ULONG returnLength;
-        NTSTATUS status = NtQueryInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority), &returnLength);
-        return NT_SUCCESS(status);
-    }
-    return false;
-}
-
-// *** 关键变更：为每个设置添加了详细的成功/失败日志 ***
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     printf("  -> Applying Job Object settings...\n");
     if (blackListJob.count(processName)) {
         printf("     - Process is in Job blacklist. Skipping settings.\n");
         return;
     }
-
     if (settings.scheduling >= 0) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
@@ -118,7 +106,6 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
             printf("     - FAILED: Could not set Scheduling Class. Error: %lu\n", GetLastError());
         }
     }
-    
     if (settings.weight >= 1) {
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
@@ -129,7 +116,6 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
             printf("     - FAILED: Could not set Quantum Weight. Error: %lu\n", GetLastError());
         }
     }
-
     if (settings.dscp >= 0) {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
@@ -142,19 +128,8 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     }
 }
 
-void ReleaseJobObject(DWORD processId) {
-    if (managedJobs.count(processId)) {
-        CloseHandle(managedJobs[processId]);
-        managedJobs.erase(processId);
-    }
-}
-
 void ForegroundBoosterThread() {
-    AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    printf("Foreground Booster started...\n");
-
+    // 主循环代码与上一版完全相同
     while (true) {
         HWND foregroundWindow = GetForegroundWindow();
         DWORD currentProcessId = 0;
@@ -197,16 +172,13 @@ void ForegroundBoosterThread() {
                         
                         if (hJob) {
                             printf("  -> Created Job Object: %ws\n", jobName.c_str());
-                            
-                            // *** 关键变更：先配置 Job，再分配进程 ***
                             ApplyJobObjectSettings(hJob, processName);
-                            
                             if (AssignProcessToJobObject(hJob, hNewProcess)) {
                                 printf("  -> Successfully assigned process to configured Job Object.\n");
                                 managedJobs[currentProcessId] = hJob;
                             } else {
                                 printf("  -> FAILED to assign process to Job Object. Error code: %lu (Process may already be in another job).\n", GetLastError());
-                                CloseHandle(hJob); // 清理未使用的 Job Object
+                                CloseHandle(hJob);
                             }
                         } else {
                             printf("  -> FAILED to create Job Object. Error code: %lu\n", GetLastError());
@@ -228,6 +200,70 @@ void ForegroundBoosterThread() {
     }
 }
 
+void DwmThread() { /* ... */ }
+
+int main() {
+    AllocConsole();
+    FILE* f;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t lastDot = path.find_last_of(L".");
+    if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
+    path += L".ini";
+    
+    // INI 解析现在会打印详细日志
+    ParseIniFile(path);
+    
+    printf("--- Starting Main Loop ---\n");
+    
+    std::thread t1(ForegroundBoosterThread);
+    std::thread t2(DwmThread);
+    t1.join();
+    t2.join();
+    return 0;
+}
+
+// 重新填充省略的函数
+std::wstring GetProcessNameById(DWORD processId) {
+    HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (handle) {
+        wchar_t buffer[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(handle, 0, buffer, &size)) {
+            CloseHandle(handle);
+            std::wstring fullPath(buffer);
+            return fullPath.substr(fullPath.find_last_of(L"\\/") + 1);
+        }
+        CloseHandle(handle);
+    }
+    return L"";
+}
+
+void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
+    static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+    if (NtSetInformationProcess) NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
+}
+
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
+    static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    if (NtQueryInformationProcess) {
+        ULONG returnLength;
+        NTSTATUS status = NtQueryInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority), &returnLength);
+        return NT_SUCCESS(status);
+    }
+    return false;
+}
+
+void ReleaseJobObject(DWORD processId) {
+    if (managedJobs.count(processId)) {
+        CloseHandle(managedJobs[processId]);
+        managedJobs.erase(processId);
+    }
+}
+
 void DwmThread() {
     HMODULE dwmapi = LoadLibraryA("dwmapi.dll");
     if (!dwmapi) return;
@@ -237,19 +273,4 @@ void DwmThread() {
         DwmEnableMMCSS(TRUE);
         std::this_thread::sleep_for(std::chrono::seconds(settings.dwmInterval));
     }
-}
-
-int main() {
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring path(exePath);
-    size_t lastDot = path.find_last_of(L".");
-    if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
-    path += L".ini";
-    ParseIniFile(path);
-    std::thread t1(ForegroundBoosterThread);
-    std::thread t2(DwmThread);
-    t1.join();
-    t2.join();
-    return 0;
 }

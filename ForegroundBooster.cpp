@@ -1,6 +1,6 @@
 #include <iostream>
 #include <windows.h>
-#include <winnt.h> // 显式包含以获取 Job Object 定义
+#include <winnt.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -9,13 +9,32 @@
 #include <set>
 #include <fstream>
 #include <sstream>
-#include <processthreadsapi.h> // 用于 QueryFullProcessImageNameW
+#include <processthreadsapi.h>
+#include <locale>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
 
+// --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
+
+// 用于检查 NTSTATUS 的宏
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+
+// I/O 优先级相关的枚举 (这些不在标准头文件中)
+typedef enum _PROCESS_INFORMATION_CLASS {
+    ProcessIoPriority = 33
+} PROCESS_INFORMATION_CLASS;
+
+typedef enum _IO_PRIORITY_HINT {
+    IoPriorityVeryLow = 0,
+    IoPriorityLow = 1,
+    IoPriorityNormal = 2,
+    IoPriorityHigh = 3,
+    IoPriorityCritical = 4,
+    MaxIoPriorityTypes
+} IO_PRIORITY_HINT;
+
 // --- Windows Native API 函数指针 ---
-// 我们对 ntdll.dll 中的函数使用函数指针
 using NtSetInformationProcessPtr = NTSTATUS(NTAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, PVOID, ULONG);
 using NtQueryInformationProcessPtr = NTSTATUS(NTAPI*)(HANDLE, PROCESS_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
@@ -34,29 +53,25 @@ std::set<std::wstring> blackList;
 std::set<std::wstring> whiteList;
 std::set<std::wstring> blackListJob;
 std::map<DWORD, HANDLE> managedJobs;
-
-// 用于存储原始优先级以便恢复的 Map
 std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
 
 // --- INI 文件解析 ---
 void ParseIniFile(const std::wstring& path) {
-    std::wifstream file(path); // 使用 wifstream 处理宽字符串
+    std::wifstream file(path);
     if (!file.is_open()) {
-        return; // 如果找不到 INI 文件则静默返回
+        return;
     }
-
-    file.imbue(std::locale("")); // 处理不同的文本编码
+    file.imbue(std::locale(""));
 
     std::wstring line;
     std::wstring currentSection;
 
     while (std::getline(file, line)) {
-        // 清理空白字符和回车
-        line.erase(0, line.find_first_not_of(L" \t\r\n"));
-        line.erase(line.find_last_not_of(L" \t\r\n") + 1);
-
-        if (line.empty() || line[0] == L';') continue;
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
 
         if (line[0] == L'[' && line.back() == L']') {
             currentSection = line.substr(1, line.size() - 2);
@@ -157,7 +172,6 @@ void ForegroundBoosterThread() {
         }
 
         if (currentProcessId != lastProcessId) {
-            // 1. 恢复上一个进程
             if (lastProcessId != 0) {
                 HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
                 if (hOldProcess) {
@@ -167,11 +181,9 @@ void ForegroundBoosterThread() {
                     }
                     CloseHandle(hOldProcess);
                 }
-                // 始终释放 Job Object
                 ReleaseJobObject(lastProcessId);
             }
 
-            // 2. 处理新进程
             if (currentProcessId != 0) {
                 std::wstring processName = GetProcessNameById(currentProcessId);
                 if (!processName.empty() && !blackList.count(processName)) {
@@ -199,9 +211,6 @@ void ForegroundBoosterThread() {
             lastProcessId = currentProcessId;
         }
         
-        // 线程附加逻辑 (此处为占位符)
-        // ...
-
         std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
     }
 }

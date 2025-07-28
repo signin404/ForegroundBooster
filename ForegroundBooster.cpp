@@ -42,6 +42,134 @@ DWORD lastProcessId = 0;
 
 // --- 函数定义 ---
 
+void ParseIniFile(const std::wstring& path) {
+    // ... (此函数与上一版完全相同)
+}
+
+std::wstring GetProcessNameById(DWORD processId) {
+    // ... (此函数与上一版完全相同)
+}
+
+void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
+    // ... (此函数与上一版完全相同)
+}
+
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
+    // ... (此函数与上一版完全相同)
+}
+
+void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
+    // ... (此函数与上一版完全相同)
+}
+
+// *** 关键变更：新的清理函数，先禁用设置，再释放句柄 ***
+void ResetAndReleaseJobObject(DWORD processId) {
+    if (managedJobs.count(processId)) {
+        HANDLE hJob = managedJobs[processId];
+        printf("  -> Resetting Job Object settings for PID: %lu\n", processId);
+
+        // 禁用调度类
+        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
+        basicInfo.LimitFlags = 0; // 清除标志位以禁用
+        SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
+        
+        // 禁用CPU权重
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
+        cpuInfo.ControlFlags = 0; // 清除标志位以禁用
+        SetInformationJobObject(hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
+
+        // 禁用DSCP
+        JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
+        netInfo.ControlFlags = 0; // 清除标志位以禁用
+        SetInformationJobObject(hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
+
+        printf("  -> Closing handle and releasing Job Object for PID: %lu\n", processId);
+        CloseHandle(hJob);
+        managedJobs.erase(processId);
+    }
+}
+
+void ForegroundBoosterThread() {
+    while (true) {
+        HWND foregroundWindow = GetForegroundWindow();
+        DWORD currentProcessId = 0;
+        if (foregroundWindow) GetWindowThreadProcessId(foregroundWindow, &currentProcessId);
+
+        if (currentProcessId != lastProcessId) {
+            if (lastProcessId != 0) {
+                printf("Foreground changed from PID: %lu\n", lastProcessId);
+                HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
+                if (hOldProcess) {
+                    if (originalIoPriorities.count(lastProcessId)) {
+                        printf("  -> Restoring I/O priority to Normal for PID: %lu\n", lastProcessId);
+                        SetProcessIoPriority(hOldProcess, originalIoPriorities[lastProcessId]);
+                        originalIoPriorities.erase(lastProcessId);
+                    }
+                    CloseHandle(hOldProcess);
+                }
+                // *** 关键变更：调用新的、更安全的清理函数 ***
+                ResetAndReleaseJobObject(lastProcessId);
+            }
+
+            if (currentProcessId != 0) {
+                printf("New foreground process PID: %lu\n", currentProcessId);
+                std::wstring processName = GetProcessNameById(currentProcessId);
+                if (!processName.empty() && !blackList.count(processName)) {
+                    printf("  -> Process name: %ws is not in blacklist.\n", processName.c_str());
+                    
+                    HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
+                    
+                    if (hNewProcess) {
+                        IO_PRIORITY_HINT currentPriority;
+                        if (GetProcessIoPriority(hNewProcess, currentPriority) && currentPriority == IoPriorityNormal) {
+                            originalIoPriorities[currentProcessId] = currentPriority;
+                            SetProcessIoPriority(hNewProcess, IoPriorityHigh);
+                            printf("  -> I/O priority elevated to High.\n");
+                        }
+                        
+                        std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
+                        HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
+                        
+                        if (hJob) {
+                            printf("  -> Created Job Object: %ws\n", jobName.c_str());
+                            ApplyJobObjectSettings(hJob, processName);
+                            if (AssignProcessToJobObject(hJob, hNewProcess)) {
+                                printf("  -> Successfully assigned process to configured Job Object.\n");
+                                managedJobs[currentProcessId] = hJob;
+                            } else {
+                                printf("  -> FAILED to assign process to Job Object. Error code: %lu (Process may already be in another job).\n", GetLastError());
+                                CloseHandle(hJob);
+                            }
+                        } else {
+                            printf("  -> FAILED to create Job Object. Error code: %lu\n", GetLastError());
+                        }
+                        CloseHandle(hNewProcess);
+                    } else {
+                        DWORD lastError = GetLastError();
+                        if (lastError == 5) {
+                            printf("  -> FAILED to open process handle (Error 5: Access Denied). This can happen with protected processes.\n");
+                        } else {
+                            printf("  -> FAILED to open process. Error code: %lu\n", lastError);
+                        }
+                    }
+                }
+            }
+            lastProcessId = currentProcessId;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
+    }
+}
+
+void DwmThread() {
+    // ... (此函数与上一版完全相同)
+}
+
+int main() {
+    // ... (此函数与上一版完全相同)
+}
+
+// --- 重新填充省略的函数以确保完整性 ---
+
 std::wstring string_to_wstring(const std::string& str) {
     if (str.empty()) return std::wstring();
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
@@ -82,7 +210,6 @@ void ParseIniFile(const std::wstring& path) {
             else if (currentSection == L"BlackListJob") blackListJob.insert(line);
         }
     }
-    printf("[Config] Finished parsing INI file.\n");
 }
 
 std::wstring GetProcessNameById(DWORD processId) {
@@ -125,118 +252,31 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         basicInfo.LimitFlags = JOB_OBJECT_LIMIT_SCHEDULING_CLASS;
         basicInfo.SchedulingClass = settings.scheduling;
-        SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
+        if (SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
+            printf("     - OK: Scheduling Class set to %d.\n", settings.scheduling);
+        } else {
+            printf("     - FAILED: Could not set Scheduling Class. Error: %lu\n", GetLastError());
+        }
     }
     if (settings.weight >= 1) {
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
         cpuInfo.Weight = settings.weight;
-        SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
+        if (SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
+            printf("     - OK: Quantum Weight set to %d.\n", settings.weight);
+        } else {
+            printf("     - FAILED: Could not set Quantum Weight. Error: %lu\n", GetLastError());
+        }
     }
     if (settings.dscp >= 0) {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
         netInfo.DscpTag = (BYTE)settings.dscp;
-        SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
-    }
-}
-
-void RevertJobObjectSettings(HANDLE jobHandle) {
-    printf("  -> Reverting Job Object settings to default...\n");
-    
-    // *** 关键变更：移除了所有不必要的、导致错误的类型转换 ***
-    JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
-    basicInfo.LimitFlags = 0;
-    SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
-
-    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
-    cpuInfo.ControlFlags = 0;
-    SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
-
-    JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-    netInfo.ControlFlags = 0;
-    SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
-}
-
-
-void ForegroundBoosterThread() {
-    while (true) {
-        HWND foregroundWindow = GetForegroundWindow();
-        DWORD currentProcessId = 0;
-        if (foregroundWindow) GetWindowThreadProcessId(foregroundWindow, &currentProcessId);
-
-        if (currentProcessId != lastProcessId) {
-            if (lastProcessId != 0) {
-                printf("Foreground changed from PID: %lu\n", lastProcessId);
-                HANDLE hOldProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, lastProcessId);
-                if (hOldProcess) {
-                    if (originalIoPriorities.count(lastProcessId)) {
-                        printf("  -> Restoring I/O priority to Normal for PID: %lu\n", lastProcessId);
-                        SetProcessIoPriority(hOldProcess, originalIoPriorities[lastProcessId]);
-                        originalIoPriorities.erase(lastProcessId);
-                    }
-                    CloseHandle(hOldProcess);
-                }
-                
-                if (managedJobs.count(lastProcessId)) {
-                    RevertJobObjectSettings(managedJobs[lastProcessId]);
-                }
-            }
-
-            if (currentProcessId != 0) {
-                printf("New foreground process PID: %lu\n", currentProcessId);
-                std::wstring processName = GetProcessNameById(currentProcessId);
-                if (!processName.empty() && !blackList.count(processName)) {
-                    printf("  -> Process name: %ws is not in blacklist.\n", processName.c_str());
-                    
-                    HANDLE hJob = NULL;
-
-                    if (managedJobs.count(currentProcessId)) {
-                        printf("  -> Found existing Job Object for this process. Reusing.\n");
-                        hJob = managedJobs[currentProcessId];
-                    } else {
-                        printf("  -> First time seeing this process. Creating new Job Object.\n");
-                        HANDLE hNewProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, currentProcessId);
-                        if (hNewProcess) {
-                            std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
-                            hJob = CreateJobObjectW(NULL, jobName.c_str());
-                            if (hJob) {
-                                if (AssignProcessToJobObject(hJob, hNewProcess)) {
-                                    printf("  -> Successfully assigned process to Job Object.\n");
-                                    managedJobs[currentProcessId] = hJob;
-                                } else {
-                                    printf("  -> FAILED to assign process to Job Object. Error: %lu\n", GetLastError());
-                                    CloseHandle(hJob);
-                                    hJob = NULL;
-                                }
-                            } else {
-                                printf("  -> FAILED to create Job Object. Error: %lu\n", GetLastError());
-                            }
-                            CloseHandle(hNewProcess);
-                        } else {
-                             printf("  -> FAILED to open process handle. Error: %lu\n", GetLastError());
-                        }
-                    }
-
-                    if (hJob) {
-                        ApplyJobObjectSettings(hJob, processName);
-                        
-                        HANDLE hProcessForIo = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, currentProcessId);
-                        if(hProcessForIo) {
-                            IO_PRIORITY_HINT currentPriority;
-                            if (GetProcessIoPriority(hProcessForIo, currentPriority) && currentPriority == IoPriorityNormal) {
-                                originalIoPriorities[currentProcessId] = currentPriority;
-                                SetProcessIoPriority(hProcessForIo, IoPriorityHigh);
-                                printf("  -> I/O priority elevated to High.\n");
-                            }
-                            CloseHandle(hProcessForIo);
-                        }
-                    }
-                }
-            }
-            lastProcessId = currentProcessId;
+        if (SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
+            printf("     - OK: DSCP Tag set to %d.\n", settings.dscp);
+        } else {
+            printf("     - FAILED: Could not set DSCP Tag. Error: %lu\n", GetLastError());
         }
-        std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
     }
 }
 
@@ -255,18 +295,14 @@ int main() {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
-    
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring path(exePath);
     size_t lastDot = path.find_last_of(L".");
     if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
     path += L".ini";
-    
     ParseIniFile(path);
-    
     printf("--- Starting Main Loop ---\n");
-    
     std::thread t1(ForegroundBoosterThread);
     std::thread t2(DwmThread);
     t1.join();

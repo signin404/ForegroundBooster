@@ -17,7 +17,10 @@ jobs:
     - name: Compile and Embed Manifest
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-        cl.exe /EHsc /O2 /W3 /Fe:ForegroundBooster.exe ForegroundBooster.cpp dwmapi.lib ntdll.lib user32.lib kernel32.lib
+        
+        # *** 关键变更：添加 /link /SUBSYSTEM:WINDOWS 参数 ***
+        cl.exe /EHsc /O2 /W3 /Fe:ForegroundBooster.exe ForegroundBooster.cpp dwmapi.lib ntdll.lib user32.lib kernel32.lib /link /SUBSYSTEM:WINDOWS
+        
         mt.exe -manifest ForegroundBooster.exe.manifest -outputresource:ForegroundBooster.exe;1
       shell: cmd
 

@@ -40,7 +40,8 @@ std::map<DWORD, HANDLE> managedJobs;
 std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
 
-// --- INI 文件解析 (已添加详细诊断日志) ---
+// --- 函数定义 ---
+
 void ParseIniFile(const std::wstring& path) {
     printf("[Config] Attempting to load INI file from: %ws\n", path.c_str());
     std::wifstream file(path);
@@ -84,11 +85,35 @@ void ParseIniFile(const std::wstring& path) {
     printf("[Config] Finished parsing INI file.\n");
 }
 
-// --- 核心功能函数 (与上一版相同) ---
-std::wstring GetProcessNameById(DWORD processId) { /* ... */ }
-void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) { /* ... */ }
-bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) { /* ... */ }
-void ReleaseJobObject(DWORD processId) { /* ... */ }
+std::wstring GetProcessNameById(DWORD processId) {
+    HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (handle) {
+        wchar_t buffer[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(handle, 0, buffer, &size)) {
+            CloseHandle(handle);
+            std::wstring fullPath(buffer);
+            return fullPath.substr(fullPath.find_last_of(L"\\/") + 1);
+        }
+        CloseHandle(handle);
+    }
+    return L"";
+}
+
+void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
+    static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+    if (NtSetInformationProcess) NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
+}
+
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
+    static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    if (NtQueryInformationProcess) {
+        ULONG returnLength;
+        NTSTATUS status = NtQueryInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority), &returnLength);
+        return NT_SUCCESS(status);
+    }
+    return false;
+}
 
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     printf("  -> Applying Job Object settings...\n");
@@ -128,8 +153,14 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     }
 }
 
+void ReleaseJobObject(DWORD processId) {
+    if (managedJobs.count(processId)) {
+        CloseHandle(managedJobs[processId]);
+        managedJobs.erase(processId);
+    }
+}
+
 void ForegroundBoosterThread() {
-    // 主循环代码与上一版完全相同
     while (true) {
         HWND foregroundWindow = GetForegroundWindow();
         DWORD currentProcessId = 0;
@@ -200,7 +231,16 @@ void ForegroundBoosterThread() {
     }
 }
 
-void DwmThread() { /* ... */ }
+void DwmThread() {
+    HMODULE dwmapi = LoadLibraryA("dwmapi.dll");
+    if (!dwmapi) return;
+    DwmEnableMMCSSPtr DwmEnableMMCSS = (DwmEnableMMCSSPtr)GetProcAddress(dwmapi, "DwmEnableMMCSS");
+    if (!DwmEnableMMCSS) { FreeLibrary(dwmapi); return; }
+    while (true) {
+        DwmEnableMMCSS(TRUE);
+        std::this_thread::sleep_for(std::chrono::seconds(settings.dwmInterval));
+    }
+}
 
 int main() {
     AllocConsole();
@@ -214,7 +254,6 @@ int main() {
     if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
     path += L".ini";
     
-    // INI 解析现在会打印详细日志
     ParseIniFile(path);
     
     printf("--- Starting Main Loop ---\n");
@@ -224,53 +263,4 @@ int main() {
     t1.join();
     t2.join();
     return 0;
-}
-
-// 重新填充省略的函数
-std::wstring GetProcessNameById(DWORD processId) {
-    HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
-    if (handle) {
-        wchar_t buffer[MAX_PATH];
-        DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameW(handle, 0, buffer, &size)) {
-            CloseHandle(handle);
-            std::wstring fullPath(buffer);
-            return fullPath.substr(fullPath.find_last_of(L"\\/") + 1);
-        }
-        CloseHandle(handle);
-    }
-    return L"";
-}
-
-void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
-    static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
-    if (NtSetInformationProcess) NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
-}
-
-bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
-    static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
-    if (NtQueryInformationProcess) {
-        ULONG returnLength;
-        NTSTATUS status = NtQueryInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority), &returnLength);
-        return NT_SUCCESS(status);
-    }
-    return false;
-}
-
-void ReleaseJobObject(DWORD processId) {
-    if (managedJobs.count(processId)) {
-        CloseHandle(managedJobs[processId]);
-        managedJobs.erase(processId);
-    }
-}
-
-void DwmThread() {
-    HMODULE dwmapi = LoadLibraryA("dwmapi.dll");
-    if (!dwmapi) return;
-    DwmEnableMMCSSPtr DwmEnableMMCSS = (DwmEnableMMCSSPtr)GetProcAddress(dwmapi, "DwmEnableMMCSS");
-    if (!DwmEnableMMCSS) { FreeLibrary(dwmapi); return; }
-    while (true) {
-        DwmEnableMMCSS(TRUE);
-        std::this_thread::sleep_for(std::chrono::seconds(settings.dwmInterval));
-    }
 }

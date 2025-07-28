@@ -20,11 +20,11 @@
 // 用于检查 NTSTATUS 的宏
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 
-// I/O 优先级相关的枚举 (这些不在标准头文件中)
-typedef enum _PROCESS_INFORMATION_CLASS {
-    ProcessIoPriority = 33
-} PROCESS_INFORMATION_CLASS;
+// PROCESS_INFORMATION_CLASS 在新版 SDK 中已定义，但 ProcessIoPriority 值没有。
+// 因此我们不重新定义该枚举，而是直接将其值定义为该类型的常量。
+const PROCESS_INFORMATION_CLASS ProcessIoPriority = (PROCESS_INFORMATION_CLASS)33;
 
+// IO_PRIORITY_HINT 枚举在标准头文件中不存在，需要我们自己定义。
 typedef enum _IO_PRIORITY_HINT {
     IoPriorityVeryLow = 0,
     IoPriorityLow = 1,

@@ -144,17 +144,17 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
 void RevertJobObjectSettings(HANDLE jobHandle) {
     printf("  -> Reverting Job Object settings to default...\n");
     
+    // *** 关键变更：移除了所有不必要的、导致错误的类型转换 ***
     JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
-    basicInfo.LimitFlags = (JOBOBJECT_BASIC_LIMIT_FLAGS)0;
+    basicInfo.LimitFlags = 0;
     SetInformationJobObject(jobHandle, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo));
 
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
-    cpuInfo.ControlFlags = (JOBOBJECT_CPU_RATE_CONTROL_FLAGS)0;
+    cpuInfo.ControlFlags = 0;
     SetInformationJobObject(jobHandle, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo));
 
     JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-    // *** 关键变更：添加显式类型转换 ***
-    netInfo.ControlFlags = (JOB_OBJECT_NET_RATE_CONTROL_FLAGS)0;
+    netInfo.ControlFlags = 0;
     SetInformationJobObject(jobHandle, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo));
 }
 

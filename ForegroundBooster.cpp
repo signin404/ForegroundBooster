@@ -14,17 +14,17 @@
 #include <cstdio> 
 #include <algorithm> 
 #include <tlhelp32.h> 
-#include <cstdarg> // For va_list
+#include <cstdarg> 
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
 
 // --- 全局变量与常量 ---
-#define COLOR_INFO      11  // 青色
-#define COLOR_SUCCESS   10  // 绿色
-#define COLOR_WARNING   14  // 黄色
-#define COLOR_ERROR     12  // 红色
-#define COLOR_DEFAULT   7   // 白色/灰色
+#define COLOR_INFO      11
+#define COLOR_SUCCESS   10
+#define COLOR_WARNING   14
+#define COLOR_ERROR     12
+#define COLOR_DEFAULT   7
 
 HANDLE g_hConsole;
 bool g_silentMode = false;
@@ -56,7 +56,7 @@ DWORD lastAttachedThreadId = 0;
 std::set<DWORD> previousPids;
 int timeAccumulator = 0;
 
-// --- 日志与函数定义 ---
+// --- 函数定义 ---
 
 void Log(const char* format, ...) {
     if (g_silentMode) return;
@@ -402,8 +402,9 @@ void DwmThread() {
     }
 }
 
-int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "-hide") {
+// *** 关键变更：入口点改为 WinMain ***
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    if (strstr(lpCmdLine, "-hide")) {
         g_silentMode = true;
     }
 

@@ -18,7 +18,7 @@
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
-#pragma comment(lib, "advapi32.lib") // For privilege functions
+#pragma comment(lib, "advapi32.lib")
 
 // --- 全局变量与常量 ---
 #define COLOR_INFO      11
@@ -77,42 +77,37 @@ void LogColor(WORD color, const char* format, ...) {
     SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
 }
 
-// *** 新增：权限提升核心函数 ***
 bool EnablePrivilege(LPCWSTR privilegeName) {
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
         return false;
     }
-
     TOKEN_PRIVILEGES tp;
     LUID luid;
-
     if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
         CloseHandle(hToken);
         return false;
     }
-
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
     if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) {
         CloseHandle(hToken);
         return false;
     }
-
     CloseHandle(hToken);
     return GetLastError() == ERROR_SUCCESS;
 }
 
 void EnableAllPrivileges() {
     LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    // *** 关键变更：所有字符串字面量都已修正为宽字符串 (L"...") ***
     const LPCWSTR privileges[] = {
-        SE_DEBUG_NAME, SE_TAKE_OWNERSHIP_NAME, SE_BACKUP_NAME,
-        SE_RESTORE_NAME, SE_TCB_NAME, SE_CREATE_TOKEN_NAME,
-        SE_ASSIGNPRIMARYTOKEN_NAME, SE_LOAD_DRIVER_NAME,
-        SE_SYSTEM_ENVIRONMENT_NAME, SE_SECURITY_NAME,
-        SE_INCREASE_QUOTA_NAME, SE_CHANGE_NOTIFY_NAME
+        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
+        L"SeRestorePrivilege", L"SeTcbPrivilege", L"SeCreateTokenPrivilege",
+        L"SeAssignPrimaryTokenPrivilege", L"SeLoadDriverPrivilege",
+        L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
+        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege"
     };
     for (const auto& priv : privileges) {
         if (EnablePrivilege(priv)) {
@@ -462,7 +457,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         freopen_s(&f, "CONOUT$", "w", stdout);
     }
     
-    // *** 关键变更：在程序启动时立即提升权限 ***
     EnableAllPrivileges();
 
     wchar_t exePath[MAX_PATH];

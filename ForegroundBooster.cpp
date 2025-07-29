@@ -18,7 +18,7 @@
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
-#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "advapi32.lib") // For privilege functions
 
 // --- 全局变量与常量 ---
 #define COLOR_INFO      11
@@ -77,37 +77,49 @@ void LogColor(WORD color, const char* format, ...) {
     SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
 }
 
+// *** 新增：权限提升核心函数 ***
 bool EnablePrivilege(LPCWSTR privilegeName) {
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
         return false;
     }
+
     TOKEN_PRIVILEGES tp;
     LUID luid;
+
     if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
         CloseHandle(hToken);
         return false;
     }
+
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
     if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) {
         CloseHandle(hToken);
         return false;
     }
+
     CloseHandle(hToken);
     return GetLastError() == ERROR_SUCCESS;
 }
 
 void EnableAllPrivileges() {
     LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
-    // *** 关键变更：所有字符串字面量都已修正为宽字符串 (L"...") ***
     const LPCWSTR privileges[] = {
-        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
-        L"SeRestorePrivilege", L"SeTcbPrivilege", L"SeCreateTokenPrivilege",
-        L"SeAssignPrimaryTokenPrivilege", L"SeLoadDriverPrivilege",
-        L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
-        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege"
+        SE_DEBUG_NAME, SE_TAKE_OWNERSHIP_NAME, SE_BACKUP_NAME,
+        SE_RESTORE_NAME, SE_TCB_NAME, SE_CREATE_TOKEN_NAME,
+        SE_ASSIGNPRIMARYTOKEN_NAME, SE_LOAD_DRIVER_NAME,
+        SE_SYSTEM_ENVIRONMENT_NAME, SE_SECURITY_NAME,
+        SE_INCREASE_QUOTA_NAME, SE_CHANGE_NOTIFY_NAME,
+        SE_SYSTEM_PROFILE_NAME, SE_SYSTEMTIME_NAME,
+        SE_PROF_SINGLE_PROCESS_NAME, SE_INC_BASE_PRIORITY_NAME,
+        SE_CREATE_PAGEFILE_NAME, SE_SHUTDOWN_NAME,
+        SE_REMOTE_SHUTDOWN_NAME, SE_UNDOCK_NAME,
+        SE_MANAGE_VOLUME_NAME, SE_INC_WORKING_SET_NAME,
+        SE_TIME_ZONE_NAME, SE_CREATE_SYMBOLIC_LINK_NAME,
+        L"SeDelegateSessionUserImpersonatePrivilege" // This one doesn't have a predefined constant
     };
     for (const auto& priv : privileges) {
         if (EnablePrivilege(priv)) {

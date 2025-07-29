@@ -18,6 +18,7 @@
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "advapi32.lib") // For privilege functions
 
 // --- 全局变量与常量 ---
 #define COLOR_INFO      11
@@ -74,6 +75,52 @@ void LogColor(WORD color, const char* format, ...) {
     vprintf(format, args);
     va_end(args);
     SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
+}
+
+// *** 新增：权限提升核心函数 ***
+bool EnablePrivilege(LPCWSTR privilegeName) {
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+
+    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    CloseHandle(hToken);
+    return GetLastError() == ERROR_SUCCESS;
+}
+
+void EnableAllPrivileges() {
+    LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    const LPCWSTR privileges[] = {
+        SE_DEBUG_NAME, SE_TAKE_OWNERSHIP_NAME, SE_BACKUP_NAME,
+        SE_RESTORE_NAME, SE_TCB_NAME, SE_CREATE_TOKEN_NAME,
+        SE_ASSIGNPRIMARYTOKEN_NAME, SE_LOAD_DRIVER_NAME,
+        SE_SYSTEM_ENVIRONMENT_NAME, SE_SECURITY_NAME,
+        SE_INCREASE_QUOTA_NAME, SE_CHANGE_NOTIFY_NAME
+    };
+    for (const auto& priv : privileges) {
+        if (EnablePrivilege(priv)) {
+            LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
+        } else {
+            LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws (这在非管理员模式下是正常的)。\n", priv);
+        }
+    }
 }
 
 std::wstring to_lower(std::wstring str) {
@@ -402,7 +449,6 @@ void DwmThread() {
     }
 }
 
-// *** 关键变更：入口点改为 WinMain ***
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     if (strstr(lpCmdLine, "-hide")) {
         g_silentMode = true;
@@ -416,6 +462,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         freopen_s(&f, "CONOUT$", "w", stdout);
     }
     
+    // *** 关键变更：在程序启动时立即提升权限 ***
+    EnableAllPrivileges();
+
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring path(exePath);

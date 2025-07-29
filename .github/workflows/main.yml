@@ -26,3 +26,4 @@ jobs:
       with:
         name: ForegroundBooster
         path: ForegroundBooster.exe
+

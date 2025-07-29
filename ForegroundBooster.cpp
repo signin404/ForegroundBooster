@@ -104,8 +104,8 @@ void EnableAllPrivileges() {
     // *** 关键变更：所有字符串字面量都已修正为宽字符串 (L"...") ***
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
-        L"SeRestorePrivilege", L"SeTcbPrivilege", L"SeCreateTokenPrivilege",
-        L"SeAssignPrimaryTokenPrivilege", L"SeLoadDriverPrivilege",
+        L"SeRestorePrivilege",
+        L"SeLoadDriverPrivilege",
         L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
         L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege",
         L"SeSystemProfilePrivilege", L"SeSystemtimePrivilege",

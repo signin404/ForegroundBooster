@@ -30,6 +30,12 @@
 HANDLE g_hConsole;
 bool g_silentMode = false;
 
+// --- IME映射功能的状态变量 ---
+HHOOK g_hKeyboardHook;
+bool g_isCtrlDown = false;
+bool g_isShiftDown = false;
+bool g_otherKeyPressed = false;
+
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 const PROCESS_INFORMATION_CLASS ProcessIoPriority = (PROCESS_INFORMATION_CLASS)33;
@@ -47,6 +53,7 @@ using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
 struct Settings {
     int dwmInterval = 60; int foregroundInterval = 2; int dscp = -1;
     int scheduling = -1; int weight = -1; int processListInterval = 10;
+    bool imeMapping = false; // 新增IME映射设置
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
@@ -79,42 +86,28 @@ void LogColor(WORD color, const char* format, ...) {
 
 bool EnablePrivilege(LPCWSTR privilegeName) {
     HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        return false;
-    }
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
     TOKEN_PRIVILEGES tp;
     LUID luid;
-    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
-        CloseHandle(hToken);
-        return false;
-    }
+    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) { CloseHandle(hToken); return false; }
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) {
-        CloseHandle(hToken);
-        return false;
-    }
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) { CloseHandle(hToken); return false; }
     CloseHandle(hToken);
     return GetLastError() == ERROR_SUCCESS;
 }
 
 void EnableAllPrivileges() {
     LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
-    // *** 关键变更：所有字符串字面量都已修正为宽字符串 (L"...") ***
     const LPCWSTR privileges[] = {
-        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
-        L"SeRestorePrivilege",
-        L"SeLoadDriverPrivilege",
-        L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
-        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege",
-        L"SeSystemProfilePrivilege", L"SeSystemtimePrivilege",
-        L"SeProfileSingleProcessPrivilege", L"SeIncreaseBasePriorityPrivilege",
-        L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege",
-        L"SeRemoteShutdownPrivilege", L"SeUndockPrivilege",
-        L"SeManageVolumePrivilege", L"SeIncreaseWorkingSetPrivilege",
-        L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege",
-        L"SeDelegateSessionUserImpersonatePrivilege"
+        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
+        L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
+        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege", L"SeSystemProfilePrivilege",
+        L"SeSystemtimePrivilege", L"SeProfileSingleProcessPrivilege", L"SeIncreaseBasePriorityPrivilege",
+        L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege", L"SeRemoteShutdownPrivilege",
+        L"SeUndockPrivilege", L"SeManageVolumePrivilege", L"SeIncreaseWorkingSetPrivilege",
+        L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
         if (EnablePrivilege(priv)) {
@@ -165,6 +158,7 @@ void ParseIniFile(const std::wstring& path) {
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
                     else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
+                    else if (key == L"IMEMapping") settings.imeMapping = (std::stoi(value) == 1); // 新增
                 }
             } else if (currentSection == L"BlackList") {
                 blackList.insert(to_lower(line));
@@ -177,6 +171,131 @@ void ParseIniFile(const std::wstring& path) {
     }
 }
 
+// --- IME映射功能核心代码 ---
+
+void SendKeyCombination(const std::vector<WORD>& keys) {
+    std::vector<INPUT> inputs(keys.size() * 2);
+    int i = 0;
+    for (WORD key : keys) {
+        inputs[i].type = INPUT_KEYBOARD;
+        inputs[i].ki.wVk = key;
+        inputs[i].ki.dwFlags = 0; // Key down
+        i++;
+    }
+    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+        inputs[i].type = INPUT_KEYBOARD;
+        inputs[i].ki.wVk = *it;
+        inputs[i].ki.dwFlags = KEYEVENTF_KEYUP; // Key up
+        i++;
+    }
+    SendInput(inputs.size(), inputs.data(), sizeof(INPUT));
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        KBDLLHOOKSTRUCT* pkbhs = (KBDLLHOOKSTRUCT*)lParam;
+        DWORD vkCode = pkbhs->vkCode;
+
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) g_isCtrlDown = true;
+            else if (vkCode == VK_LSHIFT || vkCode == VK_RSHIFT) g_isShiftDown = true;
+            else if (g_isCtrlDown && g_isShiftDown) {
+                // 如果Ctrl和Shift已经按下，此时按下的任何其他键都会使映射无效
+                g_otherKeyPressed = true;
+            }
+        } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+            bool wasCtrlOrShiftReleased = (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL || vkCode == VK_LSHIFT || vkCode == VK_RSHIFT);
+
+            // 检查是否触发映射：当Ctrl或Shift被释放时，并且之前它们都处于按下状态，且没有其他键干扰
+            if (wasCtrlOrShiftReleased && g_isCtrlDown && g_isShiftDown && !g_otherKeyPressed) {
+                // 重置状态
+                g_isCtrlDown = false;
+                g_isShiftDown = false;
+                g_otherKeyPressed = false;
+                
+                // 发送 Ctrl+Space
+                SendKeyCombination({VK_CONTROL, VK_SPACE});
+                
+                // 阻止原始的按键释放事件，以避免不必要的系统行为（如打开开始菜单）
+                return 1; 
+            }
+
+            // 释放任何一个键都会重置状态机
+            if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) g_isCtrlDown = false;
+            if (vkCode == VK_LSHIFT || vkCode == VK_RSHIFT) g_isShiftDown = false;
+            if (!g_isCtrlDown || !g_isShiftDown) {
+                g_otherKeyPressed = false;
+            }
+        }
+    }
+    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+void ImeMappingThread() {
+    g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+    if (g_hKeyboardHook) {
+        MSG msg;
+        while (GetMessage(&msg, NULL, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        UnhookWindowsHookEx(g_hKeyboardHook);
+    }
+}
+
+// --- 主程序逻辑 (与上一版相同) ---
+std::wstring GetProcessNameById(DWORD processId) { /* ... */ }
+void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) { /* ... */ }
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) { /* ... */ }
+void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) { /* ... */ }
+void ResetAndReleaseJobObject(DWORD processId) { /* ... */ }
+void CheckAndResetIoPriorities() { /* ... */ }
+void ForegroundBoosterThread() { /* ... */ }
+void DwmThread() { /* ... */ }
+
+// --- 入口点 ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    if (strstr(lpCmdLine, "-hide")) {
+        g_silentMode = true;
+    }
+
+    if (!g_silentMode) {
+        AllocConsole();
+        FILE* f;
+        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleOutputCP(65001);
+        freopen_s(&f, "CONOUT$", "w", stdout);
+    }
+    
+    EnableAllPrivileges();
+
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t lastDot = path.find_last_of(L".");
+    if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
+    path += L".ini";
+    
+    ParseIniFile(path);
+    
+    // 根据配置启动IME映射线程
+    if (settings.imeMapping) {
+        LogColor(COLOR_INFO, "[IME映射] 功能已启用，正在启动键盘挂钩线程...\n");
+        std::thread(ImeMappingThread).detach();
+    } else {
+        LogColor(COLOR_WARNING, "[IME映射] 功能未在INI文件中启用。\n");
+    }
+    
+    LogColor(COLOR_INFO, "--- 主循环已启动 ---\n");
+    
+    std::thread t1(ForegroundBoosterThread);
+    std::thread t2(DwmThread);
+    t1.join();
+    t2.join();
+    return 0;
+}
+
+// --- 重新填充省略的函数以确保完整性 ---
 std::wstring GetProcessNameById(DWORD processId) {
     HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
     if (handle) {
@@ -191,12 +310,10 @@ std::wstring GetProcessNameById(DWORD processId) {
     }
     return L"";
 }
-
 void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
     static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
     if (NtSetInformationProcess) NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
 }
-
 bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
     static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
     if (NtQueryInformationProcess) {
@@ -206,7 +323,6 @@ bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
     }
     return false;
 }
-
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     LogColor(COLOR_WARNING, "  -> 正在应用作业对象设置...\n");
     if (settings.scheduling >= 0) {
@@ -240,7 +356,6 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         }
     }
 }
-
 void ResetAndReleaseJobObject(DWORD processId) {
     if (managedJobs.count(processId)) {
         HANDLE hJob = managedJobs[processId];
@@ -257,13 +372,11 @@ void ResetAndReleaseJobObject(DWORD processId) {
         managedJobs.erase(processId);
     }
 }
-
 void CheckAndResetIoPriorities() {
     LogColor(COLOR_INFO, "[后台检查] 正在检查进程列表变化...\n");
     std::set<DWORD> currentPids;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return;
-
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
     if (Process32FirstW(hSnapshot, &pe32)) {
@@ -272,27 +385,17 @@ void CheckAndResetIoPriorities() {
         } while (Process32NextW(hSnapshot, &pe32));
     }
     CloseHandle(hSnapshot);
-
-    if (currentPids == previousPids) {
-        return;
-    }
-
+    if (currentPids == previousPids) return;
     LogColor(COLOR_WARNING, "[后台检查] 检测到进程列表变化！正在扫描所有进程的I/O优先级...\n");
     hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return;
-
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
             DWORD pid = pe32.th32ProcessID;
             std::wstring processNameLower = to_lower(pe32.szExeFile);
-
-            if (pid == lastProcessId || blackList.count(processNameLower)) {
-                continue;
-            }
-
+            if (pid == lastProcessId || blackList.count(processNameLower)) continue;
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, pid);
             if (!hProcess) continue;
-
             DWORD priorityClass = GetPriorityClass(hProcess);
             if (priorityClass == NORMAL_PRIORITY_CLASS || priorityClass == IDLE_PRIORITY_CLASS || priorityClass == BELOW_NORMAL_PRIORITY_CLASS) {
                 IO_PRIORITY_HINT ioPriority;
@@ -307,7 +410,6 @@ void CheckAndResetIoPriorities() {
     CloseHandle(hSnapshot);
     previousPids = currentPids;
 }
-
 void ForegroundBoosterThread() {
     while (true) {
         HWND foregroundWindow = GetForegroundWindow();
@@ -316,7 +418,6 @@ void ForegroundBoosterThread() {
         if (foregroundWindow) {
             currentThreadId = GetWindowThreadProcessId(foregroundWindow, &currentProcessId);
         }
-
         if (currentProcessId != lastProcessId) {
             if (lastProcessId != 0) {
                 Log("前台进程已变更 (原PID: %lu)\n", lastProcessId);
@@ -331,7 +432,6 @@ void ForegroundBoosterThread() {
                 }
                 ResetAndReleaseJobObject(lastProcessId);
             }
-
             if (currentProcessId != 0) {
                 Log("新的前台进程PID: %lu\n", currentProcessId);
                 std::wstring processNameLower = to_lower(GetProcessNameById(currentProcessId));
@@ -345,7 +445,6 @@ void ForegroundBoosterThread() {
                             SetProcessIoPriority(hNewProcess, IoPriorityHigh);
                             LogColor(COLOR_SUCCESS, "  -> I/O优先级已提升为“高”。\n");
                         }
-                        
                         if (!blackListJob.count(processNameLower)) {
                             std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
                             HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
@@ -378,7 +477,6 @@ void ForegroundBoosterThread() {
             }
             lastProcessId = currentProcessId;
         }
-
         if (currentThreadId != 0 && currentThreadId != lastAttachedThreadId) {
             LogColor(COLOR_INFO, "[附加线程] 检测到新的前台线程ID: %lu\n", currentThreadId);
             std::vector<DWORD> threadsToAttach;
@@ -407,7 +505,6 @@ void ForegroundBoosterThread() {
                 }
                 CloseHandle(hSnapshot);
             }
-
             if (!threadsToAttach.empty()) {
                 if (lastAttachedThreadId != 0) {
                     LogColor(COLOR_WARNING, "  -> 正在从旧的前台线程 %lu 分离 %zu 个白名单线程...\n", lastAttachedThreadId, threadsToAttach.size());
@@ -429,17 +526,14 @@ void ForegroundBoosterThread() {
             }
             lastAttachedThreadId = currentThreadId;
         }
-
         timeAccumulator += settings.foregroundInterval;
         if (timeAccumulator >= settings.processListInterval) {
             CheckAndResetIoPriorities();
             timeAccumulator = 0;
         }
-
         std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
     }
 }
-
 void DwmThread() {
     HMODULE dwmapi = LoadLibraryA("dwmapi.dll");
     if (!dwmapi) return;
@@ -449,37 +543,4 @@ void DwmThread() {
         DwmEnableMMCSS(TRUE);
         std::this_thread::sleep_for(std::chrono::seconds(settings.dwmInterval));
     }
-}
-
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    if (strstr(lpCmdLine, "-hide")) {
-        g_silentMode = true;
-    }
-
-    if (!g_silentMode) {
-        AllocConsole();
-        FILE* f;
-        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-        SetConsoleOutputCP(65001);
-        freopen_s(&f, "CONOUT$", "w", stdout);
-    }
-    
-    EnableAllPrivileges();
-
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring path(exePath);
-    size_t lastDot = path.find_last_of(L".");
-    if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
-    path += L".ini";
-    
-    ParseIniFile(path);
-    
-    LogColor(COLOR_INFO, "--- 主循环已启动 ---\n");
-    
-    std::thread t1(ForegroundBoosterThread);
-    std::thread t2(DwmThread);
-    t1.join();
-    t2.join();
-    return 0;
 }

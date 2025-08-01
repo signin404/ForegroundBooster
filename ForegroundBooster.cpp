@@ -30,8 +30,6 @@
 HANDLE g_hConsole;
 bool g_silentMode = false;
 HHOOK g_hKeyboardHook = NULL;
-bool g_isLCtrlPressed = false;
-bool g_isRCtrlPressed = false;
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -444,38 +442,30 @@ void DwmThread() {
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
-        KBDLLHOOKSTRUCT* pkbhs = (KBDLLHOOKSTRUCT*)lParam;
-        
-        if (pkbhs->vkCode == VK_LCONTROL || pkbhs->vkCode == VK_RCONTROL) {
-            g_isLCtrlPressed = (GetAsyncKeyState(VK_LCONTROL) & 0x8000);
-            g_isRCtrlPressed = (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-        }
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            KBDLLHOOKSTRUCT* pkbhs = (KBDLLHOOKSTRUCT*)lParam;
 
-        // *** 关键变更：实现精确映射逻辑 ***
-        if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && pkbhs->vkCode == VK_SPACE) {
-            // 条件1: 必须有Ctrl键被按下
-            bool ctrlPressed = g_isLCtrlPressed || g_isRCtrlPressed;
-
-            // 条件2: 必须没有其他修饰键被按下
-            bool otherModifiersPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ||
-                                         (GetAsyncKeyState(VK_MENU) & 0x8000) ||
-                                         (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
-                                         (GetAsyncKeyState(VK_RWIN) & 0x8000);
-
-            if (ctrlPressed && !otherModifiersPressed) {
-                INPUT input[2];
-                ZeroMemory(input, sizeof(input));
-
-                input[0].type = INPUT_KEYBOARD;
-                input[0].ki.wVk = VK_LSHIFT;
-
-                input[1].type = INPUT_KEYBOARD;
-                input[1].ki.wVk = VK_LSHIFT;
-                input[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-                SendInput(2, input, sizeof(INPUT));
+            if (pkbhs->vkCode == VK_SPACE) {
+                // *** 关键变更：使用 GetAsyncKeyState 进行实时、精确的检查 ***
+                // 条件1: Ctrl键被按下 (VK_CONTROL 检查左右两侧)
+                bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                 
-                return 1; 
+                // 条件2: 其他修饰键都未被按下
+                bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                bool winDown = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+
+                if (ctrlDown && !shiftDown && !altDown && !winDown) {
+                    INPUT input[2];
+                    ZeroMemory(input, sizeof(input));
+                    input[0].type = INPUT_KEYBOARD;
+                    input[0].ki.wVk = VK_LSHIFT;
+                    input[1].type = INPUT_KEYBOARD;
+                    input[1].ki.wVk = VK_LSHIFT;
+                    input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    SendInput(2, input, sizeof(INPUT));
+                    return 1; 
+                }
             }
         }
     }

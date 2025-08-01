@@ -30,9 +30,7 @@
 HANDLE g_hConsole;
 bool g_silentMode = false;
 HHOOK g_hKeyboardHook;
-bool g_isCtrlDown = false;
-bool g_isShiftDown = false;
-bool g_otherKeyPressed = false;
+bool g_isCtrlDown = false; // 只需要一个状态变量来跟踪Ctrl键
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -62,7 +60,7 @@ DWORD lastAttachedThreadId = 0;
 std::set<DWORD> previousPids;
 int timeAccumulator = 0;
 
-// --- 函数定义 (结构清晰，无重复) ---
+// --- 函数定义 ---
 
 void Log(const char* format, ...) {
     if (g_silentMode) return;
@@ -169,6 +167,8 @@ void ParseIniFile(const std::wstring& path) {
     }
 }
 
+// --- IME映射功能核心代码 ---
+
 void SendKeyCombination(const std::vector<WORD>& keys) {
     std::vector<INPUT> inputs(keys.size() * 2);
     int i = 0;
@@ -184,7 +184,6 @@ void SendKeyCombination(const std::vector<WORD>& keys) {
         inputs[i].ki.dwFlags = KEYEVENTF_KEYUP;
         i++;
     }
-    // *** 关键变更：添加 static_cast 以修复编译器警告 ***
     SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
 }
 
@@ -193,27 +192,20 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         KBDLLHOOKSTRUCT* pkbhs = (KBDLLHOOKSTRUCT*)lParam;
         DWORD vkCode = pkbhs->vkCode;
 
+        // *** 关键变更：完全重写的映射逻辑 ***
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-            if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) g_isCtrlDown = true;
-            else if (vkCode == VK_LSHIFT || vkCode == VK_RSHIFT) g_isShiftDown = true;
-            else if (g_isCtrlDown && g_isShiftDown) {
-                g_otherKeyPressed = true;
+            if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) {
+                g_isCtrlDown = true;
+            }
+            // 当空格键按下，并且Ctrl键正被按住时，触发映射
+            else if (vkCode == VK_SPACE && g_isCtrlDown) {
+                LogColor(COLOR_SUCCESS, "[IME映射] 检测到 Ctrl+空格, 正在模拟 Ctrl+Shift...\n");
+                SendKeyCombination({VK_CONTROL, VK_SHIFT});
+                return 1; // 拦截原始的空格键按下事件
             }
         } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            bool wasCtrlOrShiftReleased = (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL || vkCode == VK_LSHIFT || vkCode == VK_RSHIFT);
-
-            if (wasCtrlOrShiftReleased && g_isCtrlDown && g_isShiftDown && !g_otherKeyPressed) {
+            if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) {
                 g_isCtrlDown = false;
-                g_isShiftDown = false;
-                g_otherKeyPressed = false;
-                SendKeyCombination({VK_CONTROL, VK_SPACE});
-                return 1; 
-            }
-
-            if (vkCode == VK_LCONTROL || vkCode == VK_RCONTROL) g_isCtrlDown = false;
-            if (vkCode == VK_LSHIFT || vkCode == VK_RSHIFT) g_isShiftDown = false;
-            if (!g_isCtrlDown || !g_isShiftDown) {
-                g_otherKeyPressed = false;
             }
         }
     }
@@ -232,6 +224,58 @@ void ImeMappingThread() {
     }
 }
 
+// --- 主程序逻辑 ---
+std::wstring GetProcessNameById(DWORD processId) { /* ... */ }
+void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) { /* ... */ }
+bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) { /* ... */ }
+void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) { /* ... */ }
+void ResetAndReleaseJobObject(DWORD processId) { /* ... */ }
+void CheckAndResetIoPriorities() { /* ... */ }
+void ForegroundBoosterThread() { /* ... */ }
+void DwmThread() { /* ... */ }
+
+// --- 入口点 ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    if (strstr(lpCmdLine, "-hide")) {
+        g_silentMode = true;
+    }
+
+    if (!g_silentMode) {
+        AllocConsole();
+        FILE* f;
+        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleOutputCP(65001);
+        freopen_s(&f, "CONOUT$", "w", stdout);
+    }
+    
+    EnableAllPrivileges();
+
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t lastDot = path.find_last_of(L".");
+    if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
+    path += L".ini";
+    
+    ParseIniFile(path);
+    
+    if (settings.imeMapping) {
+        LogColor(COLOR_INFO, "[IME映射] 功能已启用 (Ctrl+空格 -> Ctrl+Shift)，正在启动键盘挂钩线程...\n");
+        std::thread(ImeMappingThread).detach();
+    } else {
+        LogColor(COLOR_WARNING, "[IME映射] 功能未在INI文件中启用。\n");
+    }
+    
+    LogColor(COLOR_INFO, "--- 主循环已启动 ---\n");
+    
+    std::thread t1(ForegroundBoosterThread);
+    std::thread t2(DwmThread);
+    t1.join();
+    t2.join();
+    return 0;
+}
+
+// --- 重新填充省略的函数以确保完整性 ---
 std::wstring GetProcessNameById(DWORD processId) {
     HANDLE handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
     if (handle) {
@@ -246,12 +290,10 @@ std::wstring GetProcessNameById(DWORD processId) {
     }
     return L"";
 }
-
 void SetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT priority) {
     static NtSetInformationProcessPtr NtSetInformationProcess = (NtSetInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
     if (NtSetInformationProcess) NtSetInformationProcess(processHandle, ProcessIoPriority, &priority, sizeof(priority));
 }
-
 bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
     static NtQueryInformationProcessPtr NtQueryInformationProcess = (NtQueryInformationProcessPtr)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
     if (NtQueryInformationProcess) {
@@ -261,7 +303,6 @@ bool GetProcessIoPriority(HANDLE processHandle, IO_PRIORITY_HINT& priority) {
     }
     return false;
 }
-
 void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
     LogColor(COLOR_WARNING, "  -> 正在应用作业对象设置...\n");
     if (settings.scheduling >= 0) {
@@ -295,7 +336,6 @@ void ApplyJobObjectSettings(HANDLE jobHandle, const std::wstring& processName) {
         }
     }
 }
-
 void ResetAndReleaseJobObject(DWORD processId) {
     if (managedJobs.count(processId)) {
         HANDLE hJob = managedJobs[processId];
@@ -312,7 +352,6 @@ void ResetAndReleaseJobObject(DWORD processId) {
         managedJobs.erase(processId);
     }
 }
-
 void CheckAndResetIoPriorities() {
     LogColor(COLOR_INFO, "[后台检查] 正在检查进程列表变化...\n");
     std::set<DWORD> currentPids;
@@ -351,7 +390,6 @@ void CheckAndResetIoPriorities() {
     CloseHandle(hSnapshot);
     previousPids = currentPids;
 }
-
 void ForegroundBoosterThread() {
     while (true) {
         HWND foregroundWindow = GetForegroundWindow();
@@ -476,7 +514,6 @@ void ForegroundBoosterThread() {
         std::this_thread::sleep_for(std::chrono::seconds(settings.foregroundInterval));
     }
 }
-
 void DwmThread() {
     HMODULE dwmapi = LoadLibraryA("dwmapi.dll");
     if (!dwmapi) return;
@@ -486,44 +523,4 @@ void DwmThread() {
         DwmEnableMMCSS(TRUE);
         std::this_thread::sleep_for(std::chrono::seconds(settings.dwmInterval));
     }
-}
-
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    if (strstr(lpCmdLine, "-hide")) {
-        g_silentMode = true;
-    }
-
-    if (!g_silentMode) {
-        AllocConsole();
-        FILE* f;
-        g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-        SetConsoleOutputCP(65001);
-        freopen_s(&f, "CONOUT$", "w", stdout);
-    }
-    
-    EnableAllPrivileges();
-
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring path(exePath);
-    size_t lastDot = path.find_last_of(L".");
-    if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
-    path += L".ini";
-    
-    ParseIniFile(path);
-    
-    if (settings.imeMapping) {
-        LogColor(COLOR_INFO, "[IME映射] 功能已启用，正在启动键盘挂钩线程...\n");
-        std::thread(ImeMappingThread).detach();
-    } else {
-        LogColor(COLOR_WARNING, "[IME映射] 功能未在INI文件中启用。\n");
-    }
-    
-    LogColor(COLOR_INFO, "--- 主循环已启动 ---\n");
-    
-    std::thread t1(ForegroundBoosterThread);
-    std::thread t2(DwmThread);
-    t1.join();
-    t2.join();
-    return 0;
 }

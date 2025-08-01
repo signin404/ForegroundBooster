@@ -50,7 +50,7 @@ using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
 struct Settings {
     int dwmInterval = 60; int foregroundInterval = 2; int dscp = -1;
     int scheduling = -1; int weight = -1; int processListInterval = 10;
-    bool IMEMapping = false; // 新增IME映射设置
+    bool IMEMapping = false;
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
@@ -442,22 +442,27 @@ void DwmThread() {
     }
 }
 
-// --- 新增：键盘挂钩核心逻辑 ---
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         KBDLLHOOKSTRUCT* pkbhs = (KBDLLHOOKSTRUCT*)lParam;
         
-        // 跟踪 Ctrl 键的状态
-        if (pkbhs->vkCode == VK_LCONTROL) {
-            g_isLCtrlPressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-        } else if (pkbhs->vkCode == VK_RCONTROL) {
-            g_isRCtrlPressed = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        if (pkbhs->vkCode == VK_LCONTROL || pkbhs->vkCode == VK_RCONTROL) {
+            g_isLCtrlPressed = (GetAsyncKeyState(VK_LCONTROL) & 0x8000);
+            g_isRCtrlPressed = (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
         }
 
-        // 检测 Ctrl + Space 组合键
+        // *** 关键变更：实现精确映射逻辑 ***
         if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && pkbhs->vkCode == VK_SPACE) {
-            if (g_isLCtrlPressed || g_isRCtrlPressed) {
-                // 拦截原始按键，并模拟一次 Shift 的按下和抬起
+            // 条件1: 必须有Ctrl键被按下
+            bool ctrlPressed = g_isLCtrlPressed || g_isRCtrlPressed;
+
+            // 条件2: 必须没有其他修饰键被按下
+            bool otherModifiersPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ||
+                                         (GetAsyncKeyState(VK_MENU) & 0x8000) ||
+                                         (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                                         (GetAsyncKeyState(VK_RWIN) & 0x8000);
+
+            if (ctrlPressed && !otherModifiersPressed) {
                 INPUT input[2];
                 ZeroMemory(input, sizeof(input));
 
@@ -470,7 +475,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
                 SendInput(2, input, sizeof(INPUT));
                 
-                return 1; // 返回 1 表示已处理该消息，阻止其继续传递
+                return 1; 
             }
         }
     }
@@ -483,11 +488,10 @@ void KeyboardHookThread() {
     if (g_hKeyboardHook) {
         LogColor(COLOR_SUCCESS, "[键盘挂钩] 挂钩注册成功！Ctrl+空格 映射已激活。\n");
     } else {
-        LogColor(COLOR_ERROR, "[键盘挂- 失败: 无法注册键盘挂钩。错误码: %lu\n", GetLastError());
+        LogColor(COLOR_ERROR, "[键盘挂钩] 失败: 无法注册键盘挂钩。错误码: %lu\n", GetLastError());
         return;
     }
 
-    // 运行消息循环以处理挂钩消息
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);

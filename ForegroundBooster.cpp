@@ -29,6 +29,7 @@
 
 HANDLE g_hConsole;
 bool g_silentMode = false;
+HHOOK g_hKeyboardHook = NULL;
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -47,6 +48,7 @@ using DwmEnableMMCSSPtr = HRESULT(WINAPI*)(BOOL);
 struct Settings {
     int dwmInterval = 60; int foregroundInterval = 2; int dscp = -1;
     int scheduling = -1; int weight = -1; int processListInterval = 10;
+    bool IMEMapping = false;
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
@@ -79,42 +81,28 @@ void LogColor(WORD color, const char* format, ...) {
 
 bool EnablePrivilege(LPCWSTR privilegeName) {
     HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        return false;
-    }
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
     TOKEN_PRIVILEGES tp;
     LUID luid;
-    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
-        CloseHandle(hToken);
-        return false;
-    }
+    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) { CloseHandle(hToken); return false; }
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), (PTOKEN_PRIVILEGES)NULL, (PDWORD)NULL)) {
-        CloseHandle(hToken);
-        return false;
-    }
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) { CloseHandle(hToken); return false; }
     CloseHandle(hToken);
     return GetLastError() == ERROR_SUCCESS;
 }
 
 void EnableAllPrivileges() {
     LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
-    // *** 关键变更：所有字符串字面量都已修正为宽字符串 (L"...") ***
     const LPCWSTR privileges[] = {
-        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege",
-        L"SeRestorePrivilege",
-        L"SeLoadDriverPrivilege",
-        L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
-        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege",
-        L"SeSystemProfilePrivilege", L"SeSystemtimePrivilege",
-        L"SeProfileSingleProcessPrivilege", L"SeIncreaseBasePriorityPrivilege",
-        L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege",
-        L"SeRemoteShutdownPrivilege", L"SeUndockPrivilege",
-        L"SeManageVolumePrivilege", L"SeIncreaseWorkingSetPrivilege",
-        L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege",
-        L"SeDelegateSessionUserImpersonatePrivilege"
+        L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
+        L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
+        L"SeIncreaseQuotaPrivilege", L"SeChangeNotifyPrivilege", L"SeSystemProfilePrivilege",
+        L"SeSystemtimePrivilege", L"SeProfileSingleProcessPrivilege", L"SeIncreaseBasePriorityPrivilege",
+        L"SeCreatePagefilePrivilege", L"SeShutdownPrivilege", L"SeRemoteShutdownPrivilege",
+        L"SeUndockPrivilege", L"SeManageVolumePrivilege", L"SeIncreaseWorkingSetPrivilege",
+        L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
         if (EnablePrivilege(priv)) {
@@ -165,6 +153,7 @@ void ParseIniFile(const std::wstring& path) {
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
                     else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
+                    else if (key == L"IMEMapping") settings.IMEMapping = (std::stoi(value) == 1);
                 }
             } else if (currentSection == L"BlackList") {
                 blackList.insert(to_lower(line));
@@ -451,6 +440,57 @@ void DwmThread() {
     }
 }
 
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            KBDLLHOOKSTRUCT* pkbhs = (KBDLLHOOKSTRUCT*)lParam;
+
+            if (pkbhs->vkCode == VK_SPACE) {
+                // *** 关键变更：使用 GetAsyncKeyState 进行实时、精确的检查 ***
+                // 条件1: Ctrl键被按下 (VK_CONTROL 检查左右两侧)
+                bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                
+                // 条件2: 其他修饰键都未被按下
+                bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                bool winDown = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+
+                if (ctrlDown && !shiftDown && !altDown && !winDown) {
+                    INPUT input[2];
+                    ZeroMemory(input, sizeof(input));
+                    input[0].type = INPUT_KEYBOARD;
+                    input[0].ki.wVk = VK_LSHIFT;
+                    input[1].type = INPUT_KEYBOARD;
+                    input[1].ki.wVk = VK_LSHIFT;
+                    input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    SendInput(2, input, sizeof(INPUT));
+                    return 1; 
+                }
+            }
+        }
+    }
+    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+void KeyboardHookThread() {
+    LogColor(COLOR_INFO, "[键盘挂钩] 正在注册全局键盘挂钩...\n");
+    g_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+    if (g_hKeyboardHook) {
+        LogColor(COLOR_SUCCESS, "[键盘挂钩] 挂钩注册成功！Ctrl+空格 映射已激活。\n");
+    } else {
+        LogColor(COLOR_ERROR, "[键盘挂钩] 失败: 无法注册键盘挂钩。错误码: %lu\n", GetLastError());
+        return;
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnhookWindowsHookEx(g_hKeyboardHook);
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     if (strstr(lpCmdLine, "-hide")) {
         g_silentMode = true;
@@ -477,9 +517,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     LogColor(COLOR_INFO, "--- 主循环已启动 ---\n");
     
-    std::thread t1(ForegroundBoosterThread);
-    std::thread t2(DwmThread);
-    t1.join();
-    t2.join();
+    std::vector<std::thread> threads;
+    threads.emplace_back(ForegroundBoosterThread);
+    threads.emplace_back(DwmThread);
+
+    if (settings.IMEMapping) {
+        threads.emplace_back(KeyboardHookThread);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    
     return 0;
 }

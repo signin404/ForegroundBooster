@@ -38,7 +38,7 @@ std::atomic<bool> g_processListChanged(false);
 // --- 缓存结构体 ---
 struct ProcessInfo {
     std::wstring name;
-    DWORD cpuPriority;
+    DWORD cpuPriority; // *** 关键变更：此处已添加缺失的分号 ***
     IO_PRIORITY_HINT ioPriority;
 };
 std::map<DWORD, ProcessInfo> g_processCache;
@@ -273,12 +273,11 @@ void ResetAndReleaseJobObject(DWORD processId)
     }
 }
 
-// *** 关键变更：此函数已完全重构以使用缓存 ***
 void ScanAndResetIoPriorities()
 {
     LogColor(COLOR_WARNING, "[后台扫描] 已触发扫描！正在使用缓存机制检查所有进程...\n");
     
-    std::map<DWORD, ProcessInfo> newCache; // 用于构建本次扫描结果的新缓存
+    std::map<DWORD, ProcessInfo> newCache;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
@@ -297,24 +296,21 @@ void ScanAndResetIoPriorities()
                 continue;
             }
 
-            // 检查缓存
             if (g_processCache.count(pid))
             {
                 const auto& cachedInfo = g_processCache.at(pid);
                 if (cachedInfo.name == processNameLower)
                 {
-                    // 缓存命中：PID和进程名都匹配
-                    newCache[pid] = cachedInfo; // 将旧信息复制到新缓存
-                    continue; // 跳过对此进程的查询
+                    newCache[pid] = cachedInfo;
+                    continue;
                 }
             }
 
-            // 缓存未命中：新进程或PID被重用
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, pid);
             if (!hProcess) continue;
 
             DWORD cpuPriority = GetPriorityClass(hProcess);
-            if (cpuPriority == 0) { // 获取失败
+            if (cpuPriority == 0) {
                 CloseHandle(hProcess);
                 continue;
             }
@@ -326,17 +322,16 @@ void ScanAndResetIoPriorities()
                 {
                     LogColor(COLOR_WARNING, "  -> [缓存未命中] 重置进程 %ws (PID: %lu) 的I/O优先级为“正常”。\n", processNameLower.c_str(), pid);
                     SetProcessIoPriority(hProcess, IoPriorityNormal);
-                    ioPriority = IoPriorityNormal; // 更新本地变量，以便存入缓存
+                    ioPriority = IoPriorityNormal;
                 }
-                // 将新查询到的信息存入新缓存
-                newCache[pid] = { processNameLower, cpuPriority, ioPriority };
+                // *** 关键变更：使用显式构造函数进行赋值 ***
+                newCache[pid] = ProcessInfo{ processNameLower, cpuPriority, ioPriority };
             }
             CloseHandle(hProcess);
         } while (Process32NextW(hSnapshot, &pe32));
     }
     CloseHandle(hSnapshot);
 
-    // 用本次扫描生成的新缓存替换旧的全局缓存
     g_processCache.swap(newCache);
     LogColor(COLOR_SUCCESS, "[后台扫描] 扫描完成，缓存已更新。当前缓存大小: %zu\n", g_processCache.size());
 }

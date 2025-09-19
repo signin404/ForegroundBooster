@@ -32,7 +32,6 @@
 HANDLE g_hConsole;
 bool g_silentMode = false;
 HWINEVENTHOOK g_hForegroundHook;
-HWINEVENTHOOK g_hProcessHook;
 std::atomic<bool> g_processListChanged(false);
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
@@ -550,15 +549,6 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
     }
 }
 
-void CALLBACK ProcessEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime)
-{
-    if (!g_processListChanged)
-    {
-        LogColor(COLOR_INFO, "[事件钩子] 检测到进程创建/退出事件 已标记待处理\n");
-        g_processListChanged = true;
-    }
-}
-
 void EventMessageLoopThread()
 {
     g_hForegroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, ForegroundEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
@@ -571,16 +561,6 @@ void EventMessageLoopThread()
         LogColor(COLOR_ERROR, "[事件钩子] 错误: 无法设置前台窗口事件钩子 错误码: %lu\n", GetLastError());
     }
 
-    g_hProcessHook = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, NULL, ProcessEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    if (g_hProcessHook)
-    {
-        LogColor(COLOR_SUCCESS, "[事件钩子] 成功设置进程创建/退出事件钩子\n");
-    }
-    else
-    {
-        LogColor(COLOR_ERROR, "[事件钩子] 错误: 无法设置进程事件钩子 错误码: %lu\n", GetLastError());
-    }
-
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
     {
@@ -589,7 +569,6 @@ void EventMessageLoopThread()
     }
     
     if(g_hForegroundHook) UnhookWinEvent(g_hForegroundHook);
-    if(g_hProcessHook) UnhookWinEvent(g_hProcessHook);
 }
 
 void ProcessListCheckThread()
@@ -597,15 +576,7 @@ void ProcessListCheckThread()
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::seconds(settings.processListInterval));
-        
-        if (g_processListChanged.exchange(false))
-        {
-            ScanAndResetIoPriorities();
-        }
-        else
-        {
-            Log("[后台扫描] 周期内无进程变化 跳过扫描\n");
-        }
+        ScanAndResetIoPriorities();
     }
 }
 

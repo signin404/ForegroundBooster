@@ -33,7 +33,6 @@
 HANDLE g_hConsole;
 bool g_silentMode = false;
 HWINEVENTHOOK g_hForegroundHook;
-std::atomic<bool> g_processListChanged(false);
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -59,7 +58,7 @@ struct Settings
     int scheduling = -1;
     int weight = -1;
     int processListInterval = 60;
-    bool hideVolumeOSD = false; // 新增：隐藏音量OSD的设置
+    bool hideVolumeOSD = false;
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
@@ -208,7 +207,7 @@ void ParseIniFile(const std::wstring& path)
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
                     else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
-                    else if (key == L"HideVolumeOSD") settings.hideVolumeOSD = (std::stoi(value) == 1); // 解析新设置
+                    else if (key == L"HideVolumeOSD") settings.hideVolumeOSD = (std::stoi(value) == 1);
                 }
             }
             else if (currentSection == L"BlackList")
@@ -227,7 +226,7 @@ void ParseIniFile(const std::wstring& path)
     }
 }
 
-// --- 新增：隐藏音量OSD相关功能 ---
+// --- 隐藏音量OSD相关功能 ---
 HWND FindOsdWindowInternal(const wchar_t* outerClass, const wchar_t* innerClass)
 {
     HWND hwndFound = NULL;
@@ -250,10 +249,10 @@ void ManageVolumeOSD()
 
     LogColor(COLOR_INFO, "[音量OSD] 检测到 HideVolumeOSD=1, 正在尝试隐藏系统音量弹窗...\n");
 
-    HWND hOsdWnd = NULL;
+    HWND hOsdMediaWnd = NULL;
+    HWND hOsdFlyoutWnd = NULL;
     DWORD buildNumber = 0;
 
-    // 获取系统版本号
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll) {
         RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(ntdll, "RtlGetVersion");
@@ -272,39 +271,51 @@ void ManageVolumeOSD()
 
     Log("  -> 当前系统Build版本: %lu\n", buildNumber);
 
-    // 循环尝试找到OSD窗口，因为它只在音量键按下时出现
-    for (int i = 0; i < 10 && hOsdWnd == NULL; ++i)
+    for (int i = 0; i < 10 && (hOsdMediaWnd == NULL || hOsdFlyoutWnd == NULL); ++i)
     {
+        // 查找媒体控件部分
         if (buildNumber >= 22000) // Windows 11
         {
-            hOsdWnd = FindOsdWindowInternal(L"XamlExplorerHostIslandWindow", L"Windows.UI.Composition.DesktopWindowContentBridge");
+            hOsdMediaWnd = FindOsdWindowInternal(L"XamlExplorerHostIslandWindow", L"Windows.UI.Composition.DesktopWindowContentBridge");
         }
         else // Windows 10
         {
-            hOsdWnd = FindOsdWindowInternal(L"NativeHWNDHost", L"DirectUIHWND");
+            hOsdMediaWnd = FindOsdWindowInternal(L"NativeHWNDHost", L"DirectUIHWND");
         }
+        
+        // 查找音量滑块部分
+        hOsdFlyoutWnd = FindWindowW(L"Shell_Flyout", NULL);
 
-        if (hOsdWnd) break;
+        if (hOsdMediaWnd || hOsdFlyoutWnd) break;
 
-        // 如果没找到，模拟一次音量键按下来让它显示出来
         if (i == 0) Log("  -> 未找到OSD窗口，正在模拟音量键以使其出现...\n");
         
-        keybd_event(VK_VOLUME_UP, 0, 0, 0);
-        keybd_event(VK_VOLUME_UP, 0, KEYEVENTF_KEYUP, 0);
+        // 修正：先减后加，避免100%音量时被降低
         keybd_event(VK_VOLUME_DOWN, 0, 0, 0);
         keybd_event(VK_VOLUME_DOWN, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_VOLUME_UP, 0, 0, 0);
+        keybd_event(VK_VOLUME_UP, 0, KEYEVENTF_KEYUP, 0);
         
-        Sleep(250); // 等待窗口响应
+        Sleep(250);
     }
 
-    if (hOsdWnd)
+    bool success = false;
+    if (hOsdMediaWnd)
     {
-        ShowWindow(hOsdWnd, SW_HIDE); // 隐藏窗口
-        LogColor(COLOR_SUCCESS, "  -> 成功找到并隐藏音量OSD窗口 (句柄: 0x%p)。\n", hOsdWnd);
+        ShowWindow(hOsdMediaWnd, SW_HIDE);
+        LogColor(COLOR_SUCCESS, "  -> 成功隐藏音量OSD媒体窗口 (句柄: 0x%p)。\n", hOsdMediaWnd);
+        success = true;
     }
-    else
+    if (hOsdFlyoutWnd)
     {
-        LogColor(COLOR_ERROR, "  -> 失败: 在多次尝试后仍未找到音量OSD窗口。\n");
+        ShowWindow(hOsdFlyoutWnd, SW_HIDE);
+        LogColor(COLOR_SUCCESS, "  -> 成功隐藏音量OSD滑块窗口 (句柄: 0x%p)。\n", hOsdFlyoutWnd);
+        success = true;
+    }
+
+    if (!success)
+    {
+        LogColor(COLOR_ERROR, "  -> 失败: 在多次尝试后仍未找到任何音量OSD窗口。\n");
     }
 }
 
@@ -707,7 +718,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     EnableAllPrivileges();
 
-    // 在启动主功能线程之前，执行隐藏音量OSD的操作
     ManageVolumeOSD();
     
     LogColor(COLOR_INFO, "--- 正在启动所有后台线程 ---\n");

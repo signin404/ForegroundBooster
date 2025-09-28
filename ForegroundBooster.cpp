@@ -33,6 +33,7 @@
 HANDLE g_hConsole;
 bool g_silentMode = false;
 HWINEVENTHOOK g_hForegroundHook;
+std::vector<HWND> g_hiddenOsdWindows; // 新增：用于存储被隐藏的OSD窗口句柄
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -226,33 +227,51 @@ void ParseIniFile(const std::wstring& path)
     }
 }
 
-// --- 隐藏音量OSD相关功能 ---
-HWND FindOsdWindowInternal(const wchar_t* outerClass, const wchar_t* innerClass)
-{
-    HWND hwndFound = NULL;
-    while ((hwndFound = FindWindowExW(NULL, hwndFound, outerClass, NULL)) != NULL)
-    {
-        if (FindWindowExW(hwndFound, NULL, innerClass, NULL) != NULL)
-        {
-            return hwndFound;
+// --- 隐藏/恢复音量OSD相关功能 ---
+
+struct EnumData {
+    DWORD buildNumber;
+    std::vector<HWND>* foundWindows;
+};
+
+BOOL CALLBACK EnumOsdWindowsProc(HWND hwnd, LPARAM lParam) {
+    EnumData* data = reinterpret_cast<EnumData*>(lParam);
+    wchar_t className[256];
+
+    if (!IsWindowVisible(hwnd)) {
+        return TRUE; // 继续枚举
+    }
+
+    GetClassNameW(hwnd, className, 256);
+
+    bool isMediaOsd = false;
+    if (data->buildNumber >= 22000) { // Windows 11
+        if (wcscmp(className, L"XamlExplorerHostIslandWindow") == 0 && FindWindowExW(hwnd, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL) != NULL) {
+            isMediaOsd = true;
+        }
+    } else { // Windows 10
+        if (wcscmp(className, L"NativeHWNDHost") == 0 && FindWindowExW(hwnd, NULL, L"DirectUIHWND", NULL) != NULL) {
+            isMediaOsd = true;
         }
     }
-    return NULL;
+
+    bool isFlyoutOsd = (wcscmp(className, L"Shell_Flyout") == 0);
+
+    if (isMediaOsd || isFlyoutOsd) {
+        data->foundWindows->push_back(hwnd);
+    }
+
+    return TRUE; // 继续枚举
 }
 
-void ManageVolumeOSD()
-{
-    if (!settings.hideVolumeOSD)
-    {
+void ManageVolumeOSD() {
+    if (!settings.hideVolumeOSD) {
         return;
     }
 
     LogColor(COLOR_INFO, "[音量OSD] 检测到 HideVolumeOSD=1, 正在尝试隐藏系统音量弹窗...\n");
 
-    HWND hOsdMediaWnd = NULL;
-    HWND hOsdFlyoutWnd = NULL;
     DWORD buildNumber = 0;
-
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll) {
         RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(ntdll, "RtlGetVersion");
@@ -268,29 +287,16 @@ void ManageVolumeOSD()
         LogColor(COLOR_ERROR, "  -> 失败: 无法获取系统版本号。\n");
         return;
     }
-
     Log("  -> 当前系统Build版本: %lu\n", buildNumber);
 
-    for (int i = 0; i < 10 && (hOsdMediaWnd == NULL || hOsdFlyoutWnd == NULL); ++i)
-    {
-        // 查找媒体控件部分
-        if (buildNumber >= 22000) // Windows 11
-        {
-            hOsdMediaWnd = FindOsdWindowInternal(L"XamlExplorerHostIslandWindow", L"Windows.UI.Composition.DesktopWindowContentBridge");
-        }
-        else // Windows 10
-        {
-            hOsdMediaWnd = FindOsdWindowInternal(L"NativeHWNDHost", L"DirectUIHWND");
-        }
-        
-        // 查找音量滑块部分
-        hOsdFlyoutWnd = FindWindowW(L"Shell_Flyout", NULL);
+    for (int i = 0; i < 10; ++i) {
+        EnumData data = { buildNumber, &g_hiddenOsdWindows };
+        EnumWindows(EnumOsdWindowsProc, reinterpret_cast<LPARAM>(&data));
 
-        if (hOsdMediaWnd || hOsdFlyoutWnd) break;
+        if (!g_hiddenOsdWindows.empty()) break;
 
         if (i == 0) Log("  -> 未找到OSD窗口，正在模拟音量键以使其出现...\n");
         
-        // 修正：先减后加，避免100%音量时被降低
         keybd_event(VK_VOLUME_DOWN, 0, 0, 0);
         keybd_event(VK_VOLUME_DOWN, 0, KEYEVENTF_KEYUP, 0);
         keybd_event(VK_VOLUME_UP, 0, 0, 0);
@@ -299,26 +305,42 @@ void ManageVolumeOSD()
         Sleep(250);
     }
 
-    bool success = false;
-    if (hOsdMediaWnd)
-    {
-        ShowWindow(hOsdMediaWnd, SW_HIDE);
-        LogColor(COLOR_SUCCESS, "  -> 成功隐藏音量OSD媒体窗口 (句柄: 0x%p)。\n", hOsdMediaWnd);
-        success = true;
-    }
-    if (hOsdFlyoutWnd)
-    {
-        ShowWindow(hOsdFlyoutWnd, SW_HIDE);
-        LogColor(COLOR_SUCCESS, "  -> 成功隐藏音量OSD滑块窗口 (句柄: 0x%p)。\n", hOsdFlyoutWnd);
-        success = true;
-    }
-
-    if (!success)
-    {
+    if (!g_hiddenOsdWindows.empty()) {
+        LogColor(COLOR_SUCCESS, "  -> 成功找到 %zu 个OSD相关窗口，正在隐藏...\n", g_hiddenOsdWindows.size());
+        for (HWND hwnd : g_hiddenOsdWindows) {
+            ShowWindow(hwnd, SW_HIDE);
+            Log("     - 已隐藏窗口句柄: 0x%p\n", hwnd);
+        }
+    } else {
         LogColor(COLOR_ERROR, "  -> 失败: 在多次尝试后仍未找到任何音量OSD窗口。\n");
     }
 }
 
+void RestoreOsdWindows() {
+    if (g_hiddenOsdWindows.empty()) {
+        return;
+    }
+    LogColor(COLOR_INFO, "[程序退出] 正在恢复被隐藏的 %zu 个OSD窗口...\n", g_hiddenOsdWindows.size());
+    for (HWND hwnd : g_hiddenOsdWindows) {
+        if (IsWindow(hwnd)) {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+    g_hiddenOsdWindows.clear();
+}
+
+BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
+    switch (fdwCtrlType) {
+        case CTRL_C_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_BREAK_EVENT:
+            RestoreOsdWindows();
+            ExitProcess(0);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
 
 std::wstring GetProcessNameById(DWORD processId)
 {
@@ -707,6 +729,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         freopen_s(&f, "CONOUT$", "w", stdout);
     }
     
+    // 注册控制台事件处理器，用于程序退出时恢复OSD
+    SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     std::wstring path(exePath);
@@ -729,6 +754,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     t1.join();
     t2.join();
     t3.join();
+
+    // 作为一个备用措施，虽然CtrlHandler会处理大多数情况
+    RestoreOsdWindows();
     
     return 0;
 }

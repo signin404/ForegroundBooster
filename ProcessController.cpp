@@ -10,7 +10,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
-#include <cstring> // For strcspn
+#include <io.h>      // For _setmode
+#include <fcntl.h>   // For _O_U16TEXT
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
@@ -37,21 +38,23 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
-HANDLE g_hConsole = NULL;
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
 #define COLOR_WARNING 14
+#define COLOR_ERROR 12
 #define COLOR_DEFAULT 7
 
-// --- FIX: 彻底修正 LogColor 函数，使其与 printf 保持一致 ---
-void LogColor(int color, const char* format, ...) {
-    SetConsoleTextAttribute(g_hConsole, color);
+void LogColor(int color, const wchar_t* format, ...) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, color);
+    wchar_t buffer[2048];
     va_list args;
     va_start(args, format);
-    vprintf(format, args);
+    vswprintf(buffer, sizeof(buffer) / sizeof(wchar_t), format, args);
     va_end(args);
-    SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
+    std::wcout << buffer;
+    SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
 bool EnablePrivilege(LPCWSTR privilegeName) {
@@ -69,7 +72,7 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 }
 
 void EnableAllPrivileges() {
-    LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    LogColor(COLOR_INFO, L"[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
         L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
@@ -80,25 +83,26 @@ void EnableAllPrivileges() {
         L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
-        if (EnablePrivilege(priv)) {
-            // printf 的 %ws 格式化符可以安全地打印宽字符串
-            LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
-        } else {
-            LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws\n", priv);
-        }
+        if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, L"  -> 成功启用: %ws\n", priv);
+        else LogColor(COLOR_WARNING, L"  -> 警告: 无法启用 %ws\n", priv);
     }
-    printf("----------------------------------------------------\n\n");
+    std::wcout << L"----------------------------------------------------\n" << std::endl;
 }
 
-void PrintStatusLine(const std::string& label, const std::string& value) {
-    printf("%-35s: ", label.c_str());
-    if (value == "已禁用") SetConsoleTextAttribute(g_hConsole, 12);
-    else SetConsoleTextAttribute(g_hConsole, 10);
-    printf("%s\n", value.c_str());
-    SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
+void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::wcout << label;
+    for (size_t i = label.length(); i < 20; ++i) std::wcout << L" "; // Adjusted padding for wide chars
+    std::wcout << L": ";
+    if (value == L"已禁用") SetConsoleTextAttribute(hConsole, COLOR_ERROR);
+    else SetConsoleTextAttribute(hConsole, COLOR_SUCCESS);
+    std::wcout << value << std::endl;
+    SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
-bool ParseAffinityString(const std::string& s, DWORD_PTR& mask) {
+// This function now takes wstring and converts to string for parsing
+bool ParseAffinityString(const std::wstring& w_s, DWORD_PTR& mask) {
+    std::string s(w_s.begin(), w_s.end());
     mask = 0;
     std::stringstream ss(s);
     std::string segment;
@@ -116,14 +120,6 @@ bool ParseAffinityString(const std::string& s, DWORD_PTR& mask) {
         } catch (...) { return false; }
     }
     return true;
-}
-
-std::wstring string_to_wstring(const std::string& str) {
-    if (str.empty()) return std::wstring();
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
-    std::wstring wstrTo(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
-    return wstrTo;
 }
 
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
@@ -151,7 +147,7 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
 
 void CleanupAndExit() {
     if (g_hJob != NULL && g_hJob != INVALID_HANDLE_VALUE) {
-        printf("\n正在退出... 自动移除所有限制...\n");
+        std::wcout << L"\n正在退出... 自动移除所有限制..." << std::endl;
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
         SetInformationJobObject(g_hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimit = {};
@@ -161,7 +157,7 @@ void CleanupAndExit() {
         SetInformationJobObject(g_hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
         CloseHandle(g_hJob);
         g_hJob = NULL;
-        printf("解锁成功！控制器已终止。\n");
+        std::wcout << L"解锁成功！控制器已终止。" << std::endl;
     }
 }
 
@@ -187,44 +183,37 @@ public:
     }
     void DisplayStatus() {
         system("cls");
-        printf("--- 进程控制器菜单 ---\n");
+        std::wcout << L"--- 进程控制器菜单 ---\n";
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
-        std::string affinity_str = "已禁用";
-        if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) { std::stringstream ss; ss << "0x" << std::hex << basicInfo.Affinity; affinity_str = ss.str(); }
-        PrintStatusLine("1. 亲和性 (Affinity)", affinity_str);
-        std::string priority_str = "已禁用";
+        
+        std::wstringstream wss;
+        wss << L"0x" << std::hex << basicInfo.Affinity;
+        PrintStatusLine(L"1. 亲和性 (Affinity)", (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) ? wss.str() : L"已禁用");
+        
+        std::wstring priority_str = L"已禁用";
         if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) {
             switch (basicInfo.PriorityClass) {
-                case IDLE_PRIORITY_CLASS: priority_str = "Idle"; break;
-                case BELOW_NORMAL_PRIORITY_CLASS: priority_str = "BelowNormal"; break;
-                case NORMAL_PRIORITY_CLASS: priority_str = "Normal"; break;
-                case ABOVE_NORMAL_PRIORITY_CLASS: priority_str = "AboveNormal"; break;
-                case HIGH_PRIORITY_CLASS: priority_str = "High"; break;
-                case REALTIME_PRIORITY_CLASS: priority_str = "RealTime"; break;
+                case IDLE_PRIORITY_CLASS: priority_str = L"Idle"; break;
+                case BELOW_NORMAL_PRIORITY_CLASS: priority_str = L"BelowNormal"; break;
+                case NORMAL_PRIORITY_CLASS: priority_str = L"Normal"; break;
+                case ABOVE_NORMAL_PRIORITY_CLASS: priority_str = L"AboveNormal"; break;
+                case HIGH_PRIORITY_CLASS: priority_str = L"High"; break;
+                case REALTIME_PRIORITY_CLASS: priority_str = L"RealTime"; break;
             }
         }
-        PrintStatusLine("2. 优先级 (Priority)", priority_str);
-        std::string scheduling_str = "已禁用";
-        if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_SCHEDULING_CLASS) scheduling_str = std::to_string(basicInfo.SchedulingClass);
-        PrintStatusLine("3. 调度优先级 (Scheduling)", scheduling_str);
-        std::string weight_str = "已禁用";
-        if ((cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED) && (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE)) weight_str = std::to_string(cpuInfo.Weight);
-        PrintStatusLine("4. 时间片权重 (Weight)", weight_str);
-        std::string dscp_str = "已禁用";
-        if ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) dscp_str = std::to_string(netInfo.DscpTag);
-        PrintStatusLine("5. 数据包优先级 (DSCP)", dscp_str);
-        std::string cpulimit_str = "已禁用";
-        if ((cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) && (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE)) cpulimit_str = std::to_string(cpuInfo.CpuRate / 100) + "%";
-        PrintStatusLine("6. CPU使用率限制 (CpuLimit)", cpulimit_str);
-        std::string netlimit_str = "已禁用";
-        if ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) netlimit_str = std::to_string(netInfo.MaxBandwidth / 1024) + " KB/s";
-        PrintStatusLine("7. 传出带宽限制 (NetLimit)", netlimit_str);
-        printf("----------------------------------------------------\n");
+        PrintStatusLine(L"2. 优先级 (Priority)", priority_str);
+        PrintStatusLine(L"3. 调度优先级 (Scheduling)", (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_SCHEDULING_CLASS) ? std::to_wstring(basicInfo.SchedulingClass) : L"已禁用");
+        PrintStatusLine(L"4. 时间片权重 (Weight)", ((cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED) && (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE)) ? std::to_wstring(cpuInfo.Weight) : L"已禁用");
+        PrintStatusLine(L"5. 数据包优先级 (DSCP)", ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) ? std::to_wstring(netInfo.DscpTag) : L"已禁用");
+        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", ((cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) && (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE)) ? (std::to_wstring(cpuInfo.CpuRate / 100) + L"%") : L"已禁用");
+        PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) ? (std::to_wstring(netInfo.MaxBandwidth / 1024) + L" KB/s") : L"已禁用");
+        
+        std::wcout << L"----------------------------------------------------\n";
     }
     DWORD_PTR affinity = 0;
     int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
@@ -263,26 +252,14 @@ private:
     }
 };
 
-std::string GetSanitizedInput() {
-    char buffer[512];
-    if (fgets(buffer, sizeof(buffer), stdin)) {
-        buffer[strcspn(buffer, "\r\n")] = 0;
-        return std::string(buffer);
-    }
-    return "";
-}
-
 int main(int argc, char* argv[]) {
-    AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    freopen_s(&f, "CONOUT$", "w", stderr);
-    freopen_s(&f, "CONIN$", "r", stdin);
-    g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
+    // --- The definitive, robust way to handle Unicode console I/O ---
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    _setmode(_fileno(stdin),  _O_U16TEXT);
+    _setmode(_fileno(stderr), _O_U16TEXT);
 
     EnableAllPrivileges();
+    
     std::map<std::string, std::string> args;
     bool isOneShotMode = false;
     for (int i = 1; i < argc; ++i) {
@@ -295,71 +272,75 @@ int main(int argc, char* argv[]) {
         }
     }
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        fprintf(stderr, "错误: 无法设置 Ctrl+C 处理器。\n");
+        std::wcerr << L"错误: 无法设置 Ctrl+C 处理器。" << std::endl;
         return 1;
     }
     std::vector<DWORD> pids;
-    std::string processIdentifier;
+    std::wstring processIdentifier;
     if (isOneShotMode) {
         if (args.count("processname")) {
-            processIdentifier = args["processname"];
-            pids = FindProcessByName(string_to_wstring(processIdentifier));
+            std::string narrow_id = args["processname"];
+            processIdentifier.assign(narrow_id.begin(), narrow_id.end());
+            pids = FindProcessByName(processIdentifier);
         } else if (args.count("processid")) {
-            processIdentifier = args["processid"];
-            try { pids.push_back(std::stoi(processIdentifier)); } catch(...) {}
+            std::string narrow_id = args["processid"];
+            processIdentifier.assign(narrow_id.begin(), narrow_id.end());
+            try { pids.push_back(std::stoi(narrow_id)); } catch(...) {}
         } else {
-            fprintf(stderr, "错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
+            std::wcerr << L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。" << std::endl;
             return 1;
         }
     } else {
         while (pids.empty()) {
-            printf("请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ");
-            std::string name_input = GetSanitizedInput();
+            std::wcout << L"请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ";
+            std::wstring name_input;
+            std::getline(std::wcin, name_input);
             if (!name_input.empty()) {
                 processIdentifier = name_input;
-                pids = FindProcessByName(string_to_wstring(processIdentifier));
+                pids = FindProcessByName(processIdentifier);
             } else {
-                printf("请输入目标进程ID: ");
-                std::string id_input = GetSanitizedInput();
+                std::wcout << L"请输入目标进程ID: ";
+                std::wstring id_input;
+                std::getline(std::wcin, id_input);
                 try {
                     processIdentifier = id_input;
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
-            if (pids.empty()) fprintf(stderr, "未找到任何目标进程, 请重试。\n");
+            if (pids.empty()) std::wcerr << L"未找到任何目标进程, 请重试。" << std::endl;
         }
     }
     if (pids.empty()) {
-        fprintf(stderr, "未找到任何目标进程, 脚本将退出。\n");
+        std::wcerr << L"未找到任何目标进程, 脚本将退出。" << std::endl;
         return 1;
     }
-    printf("已找到 %zu 个目标进程:\n", pids.size());
-    for (DWORD pid : pids) printf("  - PID: %lu\n", pid);
+    std::wcout << L"已找到 " << pids.size() << L" 个目标进程:" << std::endl;
+    for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
     
-    std::wstring jobName = L"Global\\ProcessControllerJob_" + string_to_wstring(processIdentifier);
+    std::wstring jobName = L"Global\\ProcessControllerJob_" + processIdentifier;
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
-        fprintf(stderr, "CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
+        LogColor(COLOR_ERROR, L"CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
         return 1;
     }
-    printf("Job Object 'Global\\ProcessControllerJob_%s' 已创建/打开。\n", processIdentifier.c_str());
+    LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, pid);
         if (hProcess) {
-            if (!AssignProcessToJobObject(g_hJob, hProcess)) fprintf(stderr, "将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
+            if (!AssignProcessToJobObject(g_hJob, hProcess)) LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
             CloseHandle(hProcess);
         } else {
-             fprintf(stderr, "打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
+             LogColor(COLOR_ERROR, L"打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
         }
     }
-    printf("已将所有目标进程分配到 Job Object。\n");
+    std::wcout << L"已将所有目标进程分配到 Job Object。" << std::endl;
     
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        printf("----------------------------------------------------\n");
-        printf("正在应用一次性设置...\n");
-        if (args.count("affinity")) { DWORD_PTR mask; if (ParseAffinityString(args["affinity"], mask)) controller.affinity = mask; }
+        std::wcout << L"----------------------------------------------------\n";
+        std::wcout << L"正在应用一次性设置..." << std::endl;
+        if (args.count("affinity")) { DWORD_PTR mask; if (ParseAffinityString(std::wstring(args["affinity"].begin(), args["affinity"].end()), mask)) controller.affinity = mask; }
         if (args.count("priority")) {
             std::string p = args["priority"];
             std::transform(p.begin(), p.end(), p.begin(), ::tolower);
@@ -375,22 +356,24 @@ int main(int argc, char* argv[]) {
         if (args.count("cpulimit")) controller.cpuLimit = std::stoi(args["cpulimit"]);
         if (args.count("dscp")) controller.dscp = std::stoi(args["dscp"]);
         if (args.count("netlimit")) controller.netLimit = std::stoi(args["netlimit"]);
-        if (controller.ApplySettings()) printf("设置已成功应用。脚本将退出，限制将持续有效。\n");
-        else fprintf(stderr, "应用设置失败！错误码: %lu\n", GetLastError());
+        if (controller.ApplySettings()) std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
+        else std::wcerr << L"应用设置失败！错误码: " << GetLastError() << std::endl;
         CloseHandle(g_hJob);
         g_hJob = NULL;
     } else {
         while (true) {
             controller.DisplayStatus();
-            printf("请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ");
-            std::string choice = GetSanitizedInput();
-            if (choice == "1") {
-                printf("新亲和性 (例: 8,10,12-15) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
-                if (input == "-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);
-            } else if (choice == "2") {
-                printf("新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
+            std::wcout << L"请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ";
+            std::wstring choice;
+            std::getline(std::wcin, choice);
+            if (choice == L"1") {
+                std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);
+            } else if (choice == L"2") {
+                std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
+                std::wstring w_input; std::getline(std::wcin, w_input);
+                std::string input(w_input.begin(), w_input.end());
                 std::transform(input.begin(), input.end(), input.begin(), ::tolower);
                 if (input == "-1") controller.priority = -1;
                 else if (input == "idle") controller.priority = IDLE_PRIORITY_CLASS;
@@ -399,31 +382,32 @@ int main(int argc, char* argv[]) {
                 else if (input == "abovenormal") controller.priority = ABOVE_NORMAL_PRIORITY_CLASS;
                 else if (input == "high") controller.priority = HIGH_PRIORITY_CLASS;
                 else if (input == "realtime") controller.priority = REALTIME_PRIORITY_CLASS;
-            } else if (choice == "3") {
-                printf("新调度优先级 (0-9) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
-                if (input == "-1") controller.scheduling = -1; else try { controller.scheduling = std::stoi(input); } catch(...) {}
-            } else if (choice == "4") {
-                printf("新时间片权重 (1-9) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
-                if (input == "-1") controller.weight = -1; else try { controller.weight = std::stoi(input); controller.cpuLimit = -1; } catch(...) {}
-            } else if (choice == "5") {
-                printf("新数据包优先级 (0-63) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
-                if (input == "-1") controller.dscp = -1; else try { controller.dscp = std::stoi(input); } catch(...) {}
-            } else if (choice == "6") {
-                printf("新CPU使用率上限 (1-100) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
-                if (input == "-1") controller.cpuLimit = -1; else try { controller.cpuLimit = std::stoi(input); controller.weight = -1; } catch(...) {}
-            } else if (choice == "7") {
-                printf("新传出带宽上限 (KB/s) 或 -1 禁用: ");
-                std::string input = GetSanitizedInput();
-                if (input == "-1") controller.netLimit = -1; else try { controller.netLimit = std::stoi(input); } catch(...) {}
-            } else if (choice == "exit") {
+            } else if (choice == L"3") {
+                std::wcout << L"新调度优先级 (0-9) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.scheduling = -1; else try { controller.scheduling = std::stoi(input); } catch(...) {}
+            } else if (choice == L"4") {
+                std::wcout << L"新时间片权重 (1-9) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.weight = -1; else try { controller.weight = std::stoi(input); controller.cpuLimit = -1; } catch(...) {}
+            } else if (choice == L"5") {
+                std::wcout << L"新数据包优先级 (0-63) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.dscp = -1; else try { controller.dscp = std::stoi(input); } catch(...) {}
+            } else if (choice == L"6") {
+                std::wcout << L"新CPU使用率上限 (1-100) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.cpuLimit = -1; else try { controller.cpuLimit = std::stoi(input); controller.weight = -1; } catch(...) {}
+            } else if (choice == L"7") {
+                std::wcout << L"新传出带宽上限 (KB/s) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.netLimit = -1; else try { controller.netLimit = std::stoi(input); } catch(...) {}
+            } else if (choice == L"exit") {
                 break;
             } else {
-                printf("无效的选择, 请按回车键重试...\n");
-                GetSanitizedInput();
+                std::wcout << L"无效的选择, 请按回车键重试...";
+                std::wstring dummy;
+                std::getline(std::wcin, dummy);
             }
             controller.ApplySettings();
         }

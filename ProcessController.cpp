@@ -4,7 +4,6 @@
 #include <string>
 #include <vector>
 #include <windows.h>
-#include <cwchar> // For wcscpy_s
 #include <psapi.h>
 #include <map>
 #include <sstream>
@@ -17,9 +16,6 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
-
-// --- 乱码修复：函数声明 ---
-void SetConsoleFont();
 
 // 使用更可靠的 Windows SDK 版本检查
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
@@ -42,22 +38,21 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
+HANDLE g_hConsole = NULL;
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
 #define COLOR_WARNING 14
 #define COLOR_DEFAULT 7
 
-void LogColor(int color, const wchar_t* format, ...) {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    SetConsoleTextAttribute(hConsole, color);
-    wchar_t buffer[1024];
+// 使用 printf 和 char*，完全模仿 ForegroundBooster
+void LogColor(int color, const char* format, ...) {
+    SetConsoleTextAttribute(g_hConsole, color);
     va_list args;
     va_start(args, format);
-    vswprintf(buffer, sizeof(buffer) / sizeof(wchar_t), format, args);
+    vprintf(format, args);
     va_end(args);
-    wprintf(L"%s", buffer);
-    SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
+    SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
 }
 
 bool EnablePrivilege(LPCWSTR privilegeName) {
@@ -81,7 +76,7 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 }
 
 void EnableAllPrivileges() {
-    LogColor(COLOR_INFO, L"[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    LogColor(COLOR_INFO, "[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
         L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
@@ -93,23 +88,21 @@ void EnableAllPrivileges() {
     };
     for (const auto& priv : privileges) {
         if (EnablePrivilege(priv)) {
-            LogColor(COLOR_SUCCESS, L"  -> 成功启用: %ws\n", priv);
+            // printf 的 %ws 格式化符可以正确打印宽字符串
+            LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
         } else {
-            LogColor(COLOR_WARNING, L"  -> 警告: 无法启用 %ws\n", priv);
+            LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws\n", priv);
         }
     }
-    std::wcout << L"----------------------------------------------------\n" << std::endl;
+    printf("----------------------------------------------------\n\n");
 }
 
 void PrintStatusLine(const std::string& label, const std::string& value) {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    std::cout << label;
-    for (size_t i = label.length(); i < 35; ++i) std::cout << " ";
-    std::cout << ": ";
-    if (value == "已禁用") SetConsoleTextAttribute(hConsole, 12);
-    else SetConsoleTextAttribute(hConsole, 10);
-    std::cout << value << std::endl;
-    SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
+    printf("%-35s: ", label.c_str());
+    if (value == "已禁用") SetConsoleTextAttribute(g_hConsole, 12);
+    else SetConsoleTextAttribute(g_hConsole, 10);
+    printf("%s\n", value.c_str());
+    SetConsoleTextAttribute(g_hConsole, COLOR_DEFAULT);
 }
 
 bool ParseAffinityString(const std::string& s, DWORD_PTR& mask) {
@@ -132,6 +125,14 @@ bool ParseAffinityString(const std::string& s, DWORD_PTR& mask) {
         } catch (...) { return false; }
     }
     return true;
+}
+
+std::wstring string_to_wstring(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
 }
 
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
@@ -159,7 +160,7 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
 
 void CleanupAndExit() {
     if (g_hJob != NULL && g_hJob != INVALID_HANDLE_VALUE) {
-        std::wcout << L"\n正在退出... 自动移除所有限制..." << std::endl;
+        printf("\n正在退出... 自动移除所有限制...\n");
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
         SetInformationJobObject(g_hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimit = {};
@@ -169,15 +170,13 @@ void CleanupAndExit() {
         SetInformationJobObject(g_hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
         CloseHandle(g_hJob);
         g_hJob = NULL;
-        std::wcout << L"解锁成功！控制器已终止。" << std::endl;
+        printf("解锁成功！控制器已终止。\n");
     }
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     switch (fdwCtrlType) {
-    case CTRL_C_EVENT:
-    case CTRL_BREAK_EVENT:
-    case CTRL_CLOSE_EVENT:
+    case CTRL_C_EVENT: case CTRL_BREAK_EVENT: case CTRL_CLOSE_EVENT:
         CleanupAndExit();
         exit(0);
         return TRUE;
@@ -197,7 +196,7 @@ public:
     }
     void DisplayStatus() {
         system("cls");
-        std::wcout << L"--- 进程控制器菜单 ---" << std::endl;
+        printf("--- 进程控制器菜单 ---\n");
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
@@ -206,9 +205,7 @@ public:
         QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
         std::string affinity_str = "已禁用";
         if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) {
-            std::stringstream ss;
-            ss << "0x" << std::hex << basicInfo.Affinity;
-            affinity_str = ss.str();
+            std::stringstream ss; ss << "0x" << std::hex << basicInfo.Affinity; affinity_str = ss.str();
         }
         PrintStatusLine("1. 亲和性 (Affinity)", affinity_str);
         std::string priority_str = "已禁用";
@@ -238,7 +235,7 @@ public:
         std::string netlimit_str = "已禁用";
         if ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) netlimit_str = std::to_string(netInfo.MaxBandwidth / 1024) + " KB/s";
         PrintStatusLine("7. 传出带宽限制 (NetLimit)", netlimit_str);
-        std::cout << "----------------------------------------------------" << std::endl;
+        printf("----------------------------------------------------\n");
     }
     DWORD_PTR affinity = 0;
     int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
@@ -278,8 +275,13 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    // --- 乱码修复：在所有输出之前，设置字体和代码页 ---
-    SetConsoleFont();
+    // --- 乱码修复：完全照抄 ForegroundBooster 的方法 ---
+    AllocConsole();
+    FILE* f;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONIN$", "r", stdin);
+    g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 
@@ -296,7 +298,7 @@ int main(int argc, char* argv[]) {
         }
     }
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        std::wcerr << L"错误: 无法设置 Ctrl+C 处理器。" << std::endl;
+        fprintf(stderr, "错误: 无法设置 Ctrl+C 处理器。\n");
         return 1;
     }
     std::vector<DWORD> pids;
@@ -304,26 +306,24 @@ int main(int argc, char* argv[]) {
     if (isOneShotMode) {
         if (args.count("processname")) {
             processIdentifier = args["processname"];
-            std::wstring wProcessName(processIdentifier.begin(), processIdentifier.end());
-            pids = FindProcessByName(wProcessName);
+            pids = FindProcessByName(string_to_wstring(processIdentifier));
         } else if (args.count("processid")) {
             processIdentifier = args["processid"];
             try { pids.push_back(std::stoi(processIdentifier)); } catch(...) {}
         } else {
-            std::wcerr << L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。" << std::endl;
+            fprintf(stderr, "错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
             return 1;
         }
     } else {
         while (pids.empty()) {
-            std::wcout << L"请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ";
+            printf("请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ");
             std::string name_input;
             std::getline(std::cin, name_input);
             if (!name_input.empty()) {
                 processIdentifier = name_input;
-                std::wstring wProcessName(name_input.begin(), name_input.end());
-                pids = FindProcessByName(wProcessName);
+                pids = FindProcessByName(string_to_wstring(processIdentifier));
             } else {
-                std::wcout << L"请输入目标进程ID: ";
+                printf("请输入目标进程ID: ");
                 std::string id_input;
                 std::getline(std::cin, id_input);
                 try {
@@ -331,36 +331,39 @@ int main(int argc, char* argv[]) {
                     pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
-            if (pids.empty()) std::wcerr << L"未找到任何目标进程, 请重试。" << std::endl;
+            if (pids.empty()) fprintf(stderr, "未找到任何目标进程, 请重试。\n");
         }
     }
     if (pids.empty()) {
-        std::wcerr << L"未找到任何目标进程, 脚本将退出。" << std::endl;
+        fprintf(stderr, "未找到任何目标进程, 脚本将退出。\n");
         return 1;
     }
-    std::wcout << L"已找到 " << pids.size() << L" 个目标进程:" << std::endl;
-    for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
-    std::wstring jobName = L"Global\\ProcessControllerJob_" + std::wstring(processIdentifier.begin(), processIdentifier.end());
+    printf("已找到 %zu 个目标进程:\n", pids.size());
+    for (DWORD pid : pids) printf("  - PID: %lu\n", pid);
+    
+    std::wstring jobName = L"Global\\ProcessControllerJob_" + string_to_wstring(processIdentifier);
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
-        std::wcerr << L"CreateJobObjectW 失败！错误码: " << GetLastError() << std::endl;
+        fprintf(stderr, "CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
         return 1;
     }
-    std::wcout << L"Job Object '" << jobName << L"' 已创建/打开。" << std::endl;
+    printf("Job Object 'Global\\ProcessControllerJob_%s' 已创建/打开。\n", processIdentifier.c_str());
+    
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, pid);
         if (hProcess) {
-            if (!AssignProcessToJobObject(g_hJob, hProcess)) std::wcerr << L"将 PID " << pid << L" 分配到 Job Object 失败！错误码: " << GetLastError() << std::endl;
+            if (!AssignProcessToJobObject(g_hJob, hProcess)) fprintf(stderr, "将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
             CloseHandle(hProcess);
         } else {
-             std::wcerr << L"打开 PID " << pid << L" 失败！错误码: " << GetLastError() << std::endl;
+             fprintf(stderr, "打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
         }
     }
-    std::wcout << L"已将所有目标进程分配到 Job Object。" << std::endl;
+    printf("已将所有目标进程分配到 Job Object。\n");
+    
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        std::cout << "----------------------------------------------------" << std::endl;
-        std::wcout << L"正在应用一次性设置..." << std::endl;
+        printf("----------------------------------------------------\n");
+        printf("正在应用一次性设置...\n");
         if (args.count("affinity")) { DWORD_PTR mask; if (ParseAffinityString(args["affinity"], mask)) controller.affinity = mask; }
         if (args.count("priority")) {
             std::string p = args["priority"];
@@ -377,22 +380,22 @@ int main(int argc, char* argv[]) {
         if (args.count("cpulimit")) controller.cpuLimit = std::stoi(args["cpulimit"]);
         if (args.count("dscp")) controller.dscp = std::stoi(args["dscp"]);
         if (args.count("netlimit")) controller.netLimit = std::stoi(args["netlimit"]);
-        if (controller.ApplySettings()) std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
-        else std::wcerr << L"应用设置失败！错误码: " << GetLastError() << std::endl;
+        if (controller.ApplySettings()) printf("设置已成功应用。脚本将退出，限制将持续有效。\n");
+        else fprintf(stderr, "应用设置失败！错误码: %lu\n", GetLastError());
         CloseHandle(g_hJob);
         g_hJob = NULL;
     } else {
         while (true) {
             controller.DisplayStatus();
-            std::wcout << L"请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ";
+            printf("请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ");
             std::string choice;
             std::getline(std::cin, choice);
             if (choice == "1") {
-                std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
+                printf("新亲和性 (例: 8,10,12-15) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);
             } else if (choice == "2") {
-                std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
+                printf("新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 std::transform(input.begin(), input.end(), input.begin(), ::tolower);
                 if (input == "-1") controller.priority = -1;
@@ -403,29 +406,29 @@ int main(int argc, char* argv[]) {
                 else if (input == "high") controller.priority = HIGH_PRIORITY_CLASS;
                 else if (input == "realtime") controller.priority = REALTIME_PRIORITY_CLASS;
             } else if (choice == "3") {
-                std::wcout << L"新调度优先级 (0-9) 或 -1 禁用: ";
+                printf("新调度优先级 (0-9) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.scheduling = -1; else controller.scheduling = std::stoi(input);
             } else if (choice == "4") {
-                std::wcout << L"新时间片权重 (1-9) 或 -1 禁用: ";
+                printf("新时间片权重 (1-9) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.weight = -1; else { controller.weight = std::stoi(input); controller.cpuLimit = -1; }
             } else if (choice == "5") {
-                std::wcout << L"新数据包优先级 (0-63) 或 -1 禁用: ";
+                printf("新数据包优先级 (0-63) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.dscp = -1; else controller.dscp = std::stoi(input);
             } else if (choice == "6") {
-                std::wcout << L"新CPU使用率上限 (1-100) 或 -1 禁用: ";
+                printf("新CPU使用率上限 (1-100) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.cpuLimit = -1; else { controller.cpuLimit = std::stoi(input); controller.weight = -1; }
             } else if (choice == "7") {
-                std::wcout << L"新传出带宽上限 (KB/s) 或 -1 禁用: ";
+                printf("新传出带宽上限 (KB/s) 或 -1 禁用: ");
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.netLimit = -1; else controller.netLimit = std::stoi(input);
             } else if (choice == "exit") {
                 break;
             } else {
-                std::wcout << L"无效的选择, 请按回车键重试...";
+                printf("无效的选择, 请按回车键重试...");
                 std::cin.get();
             }
             controller.ApplySettings();
@@ -433,24 +436,4 @@ int main(int argc, char* argv[]) {
         CleanupAndExit();
     }
     return 0;
-}
-
-// --- 乱码修复：函数定义 ---
-// 此函数尝试将控制台字体设置为支持中文的字体，如 "新宋体" 或 "Consolas"
-void SetConsoleFont() {
-    CONSOLE_FONT_INFOEX cfi;
-    cfi.cbSize = sizeof(cfi);
-    cfi.nFont = 0;
-    cfi.dwFontSize.X = 0;
-    cfi.dwFontSize.Y = 16; // 设置一个合适的字体大小
-    cfi.FontFamily = FF_DONTCARE;
-    cfi.FontWeight = FW_NORMAL;
-
-    // 尝试设置 "新宋体"，如果失败则尝试 "Consolas"
-    // "新宋体" (NSimSun) 在中文系统上几乎肯定存在
-    if (wcscpy_s(cfi.FaceName, LF_FACESIZE, L"NSimSun") != 0) {
-        wcscpy_s(cfi.FaceName, LF_FACESIZE, L"Consolas"); // 备用字体
-    }
-    
-    SetCurrentConsoleFontEx(GetStdHandle(STD_OUTPUT_HANDLE), FALSE, &cfi);
 }

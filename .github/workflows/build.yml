@@ -18,8 +18,8 @@ jobs:
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
         
-        rem --- FIX: 添加 /D UNICODE 和 /D _UNICODE 标志来强制使用 Unicode 编译 ---
-        cl.exe /EHsc /O2 /W3 /D UNICODE /D _UNICODE /Fe:ProcessController.exe ProcessController.cpp kernel32.lib user32.lib psapi.lib /link /SUBSYSTEM:CONSOLE
+        rem --- FIX: 添加 advapi32.lib 到链接库列表 ---
+        cl.exe /EHsc /O2 /W3 /D UNICODE /D _UNICODE /Fe:ProcessController.exe ProcessController.cpp kernel32.lib user32.lib psapi.lib advapi32.lib /link /SUBSYSTEM:CONSOLE
         
         mt.exe -manifest ProcessController.exe.manifest -outputresource:ProcessController.exe;1
       shell: cmd

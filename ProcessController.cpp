@@ -1,6 +1,4 @@
 // ProcessController.cpp
-// 编译命令 (在 Visual Studio 命令行工具中):
-// cl.exe /EHsc /O2 /W3 /Fe:ProcessController.exe ProcessController.cpp kernel32.lib user32.lib psapi.lib /link /SUBSYSTEM:CONSOLE
 
 #include <iostream>
 #include <string>
@@ -14,8 +12,13 @@
 #include <cctype>
 #include <cstdarg> // 用于可变参数
 
-// --- FIX 1: 使用更可靠的 Windows SDK 版本检查来决定是否定义旧版结构体 ---
-// NTDDI_WIN10_RS1 是第一个正式包含这些网络 Job Object 结构的 SDK 版本
+// --- FIX 1: 在代码中直接链接所有需要的库 ---
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "advapi32.lib") // 包含了权限管理函数
+
+// 使用更可靠的 Windows SDK 版本检查来决定是否定义旧版结构体
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
 #define JOB_OBJECT_NET_RATE_CONTROL_ENABLE     0x1
@@ -184,16 +187,13 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     cProcesses = cbNeeded / sizeof(DWORD);
     for (unsigned int i = 0; i < cProcesses; i++) {
         if (aProcesses[i] != 0) {
-            // --- FIX: 显式使用 wchar_t 而不是 TCHAR ---
             wchar_t szProcessName[MAX_PATH] = L"<unknown>";
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, aProcesses[i]);
             if (NULL != hProcess) {
                 HMODULE hMod;
                 DWORD cbNeeded2;
-                // --- FIX: 显式调用宽字符版函数 GetModuleBaseNameW ---
                 if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded2)) {
                     GetModuleBaseNameW(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(wchar_t));
-                    // 现在 processName (wstring) 和 szProcessName (wchar_t*) 类型兼容，可以比较
                     if (processName == szProcessName) {
                         pids.push_back(aProcesses[i]);
                     }
@@ -222,7 +222,6 @@ void CleanupAndExit() {
 
         // 清空网络限制
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimit = { 0 };
-        // --- FIX 3: 使用 static_cast 将 0 转换为强类型枚举 ---
         netLimit.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0); // 禁用
         SetInformationJobObject(g_hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
 
@@ -379,7 +378,6 @@ private:
 
     bool UpdateNetLimits() {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimitInfo = { 0 };
-        // --- FIX 3 (continued): 使用 static_cast 进行初始化和位运算 ---
         netLimitInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
 
         if (netLimit != -1) {
@@ -402,7 +400,11 @@ private:
 
 // --- 主函数 ---
 int main(int argc, char* argv[]) {
-    // **步骤 1: 在程序启动时立即提升权限**
+    // --- FIX 2: 设置控制台输出和输入为 UTF-8 编码页以防止乱码 ---
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
+    // 在程序启动时立即提升权限
     EnableAllPrivileges();
 
     std::map<std::string, std::string> args;
@@ -411,9 +413,7 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg.rfind('-', 0) == 0 && i + 1 < argc) {
             isOneShotMode = true;
-            // 移除前导 '-'
             arg.erase(0, 1); 
-            // 转为小写以方便比较
             std::transform(arg.begin(), arg.end(), arg.begin(), [](unsigned char c){ return std::tolower(c); });
             args[arg] = argv[++i];
         }
@@ -443,7 +443,8 @@ int main(int argc, char* argv[]) {
         }
     } else {
         while (pids.empty()) {
-            std::cout << "请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ";
+            // 使用 wcout 输出宽字符提示信息
+            std::wcout << L"请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ";
             std::string name_input;
             std::getline(std::cin, name_input);
             if (!name_input.empty()) {
@@ -451,7 +452,7 @@ int main(int argc, char* argv[]) {
                 std::wstring wProcessName(name_input.begin(), name_input.end());
                 pids = FindProcessByName(wProcessName);
             } else {
-                std::cout << "请输入目标进程ID: ";
+                std::wcout << L"请输入目标进程ID: ";
                 std::string id_input;
                 std::getline(std::cin, id_input);
                 try {
@@ -460,13 +461,13 @@ int main(int argc, char* argv[]) {
                 } catch(...) { /* 无效ID */ }
             }
             if (pids.empty()) {
-                std::cerr << "未找到任何目标进程, 请重试。" << std::endl;
+                std::wcerr << L"未找到任何目标进程, 请重试。" << std::endl;
             }
         }
     }
 
     if (pids.empty()) {
-        std::cerr << "未找到任何目标进程, 脚本将退出。" << std::endl;
+        std::wcerr << L"未找到任何目标进程, 脚本将退出。" << std::endl;
         return 1;
     }
 
@@ -479,7 +480,7 @@ int main(int argc, char* argv[]) {
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
 
     if (g_hJob == NULL) {
-        std::cerr << "CreateJobObjectW 失败！错误码: " << GetLastError() << std::endl;
+        std::wcerr << L"CreateJobObjectW 失败！错误码: " << GetLastError() << std::endl;
         return 1;
     }
     std::wcout << L"Job Object '" << jobName << L"' 已创建/打开。" << std::endl;
@@ -488,20 +489,20 @@ int main(int argc, char* argv[]) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, pid);
         if (hProcess) {
             if (!AssignProcessToJobObject(g_hJob, hProcess)) {
-                std::cerr << "将 PID " << pid << " 分配到 Job Object 失败！错误码: " << GetLastError() << std::endl;
+                std::wcerr << L"将 PID " << pid << L" 分配到 Job Object 失败！错误码: " << GetLastError() << std::endl;
             }
             CloseHandle(hProcess);
         } else {
-             std::cerr << "打开 PID " << pid << " 失败！错误码: " << GetLastError() << std::endl;
+             std::wcerr << L"打开 PID " << pid << L" 失败！错误码: " << GetLastError() << std::endl;
         }
     }
-    std::cout << "已将所有目标进程分配到 Job Object。" << std::endl;
+    std::wcout << L"已将所有目标进程分配到 Job Object。" << std::endl;
 
     JobController controller(g_hJob);
 
     if (isOneShotMode) {
         std::cout << "----------------------------------------------------" << std::endl;
-        std::cout << "正在应用一次性设置..." << std::endl;
+        std::wcout << L"正在应用一次性设置..." << std::endl;
         if (args.count("affinity")) {
             DWORD_PTR mask;
             if (ParseAffinityString(args["affinity"], mask)) controller.affinity = mask;
@@ -523,28 +524,27 @@ int main(int argc, char* argv[]) {
         if (args.count("netlimit")) controller.netLimit = std::stoi(args["netlimit"]);
         
         if (controller.ApplySettings()) {
-            std::cout << "设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
+            std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
         } else {
-            std::cerr << "应用设置失败！错误码: " << GetLastError() << std::endl;
+            std::wcerr << L"应用设置失败！错误码: " << GetLastError() << std::endl;
         }
-        // 在一次性模式下，不调用清理函数，让限制保留
         CloseHandle(g_hJob);
         g_hJob = NULL;
 
     } else { // 交互模式
         while (true) {
             controller.DisplayStatus();
-            std::cout << "请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ";
+            std::wcout << L"请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ";
             std::string choice;
             std::getline(std::cin, choice);
 
             if (choice == "1") {
-                std::cout << "新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
+                std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.affinity = 0;
                 else ParseAffinityString(input, controller.affinity);
             } else if (choice == "2") {
-                std::cout << "新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
+                std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 std::transform(input.begin(), input.end(), input.begin(), ::tolower);
                 if (input == "-1") controller.priority = -1;
@@ -555,31 +555,31 @@ int main(int argc, char* argv[]) {
                 else if (input == "high") controller.priority = HIGH_PRIORITY_CLASS;
                 else if (input == "realtime") controller.priority = REALTIME_PRIORITY_CLASS;
             } else if (choice == "3") {
-                std::cout << "新调度优先级 (0-9) 或 -1 禁用: ";
+                std::wcout << L"新调度优先级 (0-9) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.scheduling = -1; else controller.scheduling = std::stoi(input);
             } else if (choice == "4") {
-                std::cout << "新时间片权重 (1-9) 或 -1 禁用: ";
+                std::wcout << L"新时间片权重 (1-9) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.weight = -1;
                 else { controller.weight = std::stoi(input); controller.cpuLimit = -1; } // 权重和硬上限互斥
             } else if (choice == "5") {
-                std::cout << "新数据包优先级 (0-63) 或 -1 禁用: ";
+                std::wcout << L"新数据包优先级 (0-63) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.dscp = -1; else controller.dscp = std::stoi(input);
             } else if (choice == "6") {
-                std::cout << "新CPU使用率上限 (1-100) 或 -1 禁用: ";
+                std::wcout << L"新CPU使用率上限 (1-100) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.cpuLimit = -1;
                 else { controller.cpuLimit = std::stoi(input); controller.weight = -1; } // 权重和硬上限互斥
             } else if (choice == "7") {
-                std::cout << "新传出带宽上限 (KB/s) 或 -1 禁用: ";
+                std::wcout << L"新传出带宽上限 (KB/s) 或 -1 禁用: ";
                 std::string input; std::getline(std::cin, input);
                 if (input == "-1") controller.netLimit = -1; else controller.netLimit = std::stoi(input);
             } else if (choice == "exit") {
                 break;
             } else {
-                std::cout << "无效的选择, 请按回车键重试...";
+                std::wcout << L"无效的选择, 请按回车键重试...";
                 std::cin.get();
             }
             controller.ApplySettings();

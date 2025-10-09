@@ -44,6 +44,7 @@ HANDLE g_hConsole = NULL;
 #define COLOR_WARNING 14
 #define COLOR_DEFAULT 7
 
+// --- FIX: 彻底修正 LogColor 函数，使其与 printf 保持一致 ---
 void LogColor(int color, const char* format, ...) {
     SetConsoleTextAttribute(g_hConsole, color);
     va_list args;
@@ -79,8 +80,12 @@ void EnableAllPrivileges() {
         L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
-        if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
-        else LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws\n", priv);
+        if (EnablePrivilege(priv)) {
+            // printf 的 %ws 格式化符可以安全地打印宽字符串
+            LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
+        } else {
+            LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws\n", priv);
+        }
     }
     printf("----------------------------------------------------\n\n");
 }
@@ -258,11 +263,9 @@ private:
     }
 };
 
-// --- FIX: 创建一个安全的输入函数来替代 std::getline(std::cin, ...) ---
 std::string GetSanitizedInput() {
     char buffer[512];
     if (fgets(buffer, sizeof(buffer), stdin)) {
-        // 移除 fgets 读取到的末尾换行符
         buffer[strcspn(buffer, "\r\n")] = 0;
         return std::string(buffer);
     }
@@ -311,16 +314,16 @@ int main(int argc, char* argv[]) {
     } else {
         while (pids.empty()) {
             printf("请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ");
-            std::string name_input = GetSanitizedInput(); // 使用安全输入函数
+            std::string name_input = GetSanitizedInput();
             if (!name_input.empty()) {
                 processIdentifier = name_input;
                 pids = FindProcessByName(string_to_wstring(processIdentifier));
             } else {
                 printf("请输入目标进程ID: ");
-                std::string id_input = GetSanitizedInput(); // 使用安全输入函数
+                std::string id_input = GetSanitizedInput();
                 try {
                     processIdentifier = id_input;
-                    pids.push_back(std::stoi(id_input));
+                    if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
             if (pids.empty()) fprintf(stderr, "未找到任何目标进程, 请重试。\n");
@@ -380,7 +383,7 @@ int main(int argc, char* argv[]) {
         while (true) {
             controller.DisplayStatus();
             printf("请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ");
-            std::string choice = GetSanitizedInput(); // 使用安全输入函数
+            std::string choice = GetSanitizedInput();
             if (choice == "1") {
                 printf("新亲和性 (例: 8,10,12-15) 或 -1 禁用: ");
                 std::string input = GetSanitizedInput();
@@ -399,28 +402,28 @@ int main(int argc, char* argv[]) {
             } else if (choice == "3") {
                 printf("新调度优先级 (0-9) 或 -1 禁用: ");
                 std::string input = GetSanitizedInput();
-                if (input == "-1") controller.scheduling = -1; else controller.scheduling = std::stoi(input);
+                if (input == "-1") controller.scheduling = -1; else try { controller.scheduling = std::stoi(input); } catch(...) {}
             } else if (choice == "4") {
                 printf("新时间片权重 (1-9) 或 -1 禁用: ");
                 std::string input = GetSanitizedInput();
-                if (input == "-1") controller.weight = -1; else { controller.weight = std::stoi(input); controller.cpuLimit = -1; }
+                if (input == "-1") controller.weight = -1; else try { controller.weight = std::stoi(input); controller.cpuLimit = -1; } catch(...) {}
             } else if (choice == "5") {
                 printf("新数据包优先级 (0-63) 或 -1 禁用: ");
                 std::string input = GetSanitizedInput();
-                if (input == "-1") controller.dscp = -1; else controller.dscp = std::stoi(input);
+                if (input == "-1") controller.dscp = -1; else try { controller.dscp = std::stoi(input); } catch(...) {}
             } else if (choice == "6") {
                 printf("新CPU使用率上限 (1-100) 或 -1 禁用: ");
                 std::string input = GetSanitizedInput();
-                if (input == "-1") controller.cpuLimit = -1; else { controller.cpuLimit = std::stoi(input); controller.weight = -1; }
+                if (input == "-1") controller.cpuLimit = -1; else try { controller.cpuLimit = std::stoi(input); controller.weight = -1; } catch(...) {}
             } else if (choice == "7") {
                 printf("新传出带宽上限 (KB/s) 或 -1 禁用: ");
                 std::string input = GetSanitizedInput();
-                if (input == "-1") controller.netLimit = -1; else controller.netLimit = std::stoi(input);
+                if (input == "-1") controller.netLimit = -1; else try { controller.netLimit = std::stoi(input); } catch(...) {}
             } else if (choice == "exit") {
                 break;
             } else {
                 printf("无效的选择, 请按回车键重试...\n");
-                GetSanitizedInput(); // 等待用户按回车
+                GetSanitizedInput();
             }
             controller.ApplySettings();
         }

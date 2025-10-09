@@ -184,15 +184,17 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     cProcesses = cbNeeded / sizeof(DWORD);
     for (unsigned int i = 0; i < cProcesses; i++) {
         if (aProcesses[i] != 0) {
-            TCHAR szProcessName[MAX_PATH] = TEXT("<unknown>");
+            // --- FIX: 显式使用 wchar_t 而不是 TCHAR ---
+            wchar_t szProcessName[MAX_PATH] = L"<unknown>";
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, aProcesses[i]);
             if (NULL != hProcess) {
                 HMODULE hMod;
                 DWORD cbNeeded2;
+                // --- FIX: 显式调用宽字符版函数 GetModuleBaseNameW ---
                 if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded2)) {
-                    GetModuleBaseName(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(TCHAR));
-                    // --- FIX 2: 将 TCHAR 数组转换为 std::wstring 进行比较 ---
-                    if (processName == std::wstring(szProcessName)) {
+                    GetModuleBaseNameW(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(wchar_t));
+                    // 现在 processName (wstring) 和 szProcessName (wchar_t*) 类型兼容，可以比较
+                    if (processName == szProcessName) {
                         pids.push_back(aProcesses[i]);
                     }
                 }

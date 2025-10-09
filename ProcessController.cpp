@@ -14,8 +14,9 @@
 #include <cctype>
 #include <cstdarg> // 用于可变参数
 
-// --- 确保旧版 SDK 也能编译，手动定义缺失的结构体和枚举 ---
-
+// --- FIX 1: 使用更可靠的 Windows SDK 版本检查来决定是否定义旧版结构体 ---
+// NTDDI_WIN10_RS1 是第一个正式包含这些网络 Job Object 结构的 SDK 版本
+#if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
 #define JOB_OBJECT_NET_RATE_CONTROL_ENABLE     0x1
 #define JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH 0x2
@@ -34,6 +35,8 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #ifndef JobObjectNetRateControlInformation
 #define JobObjectNetRateControlInformation (JOBOBJECTINFOCLASS)32
 #endif
+#endif // (NTDDI_VERSION < NTDDI_WIN10_RS1)
+
 
 // --- 全局变量 ---
 HANDLE g_hJob = NULL; // 全局 Job Object 句柄，用于清理
@@ -188,7 +191,8 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
                 DWORD cbNeeded2;
                 if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded2)) {
                     GetModuleBaseName(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(TCHAR));
-                    if (processName == szProcessName) {
+                    // --- FIX 2: 将 TCHAR 数组转换为 std::wstring 进行比较 ---
+                    if (processName == std::wstring(szProcessName)) {
                         pids.push_back(aProcesses[i]);
                     }
                 }
@@ -216,7 +220,8 @@ void CleanupAndExit() {
 
         // 清空网络限制
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimit = { 0 };
-        netLimit.ControlFlags = 0; // 禁用
+        // --- FIX 3: 使用 static_cast 将 0 转换为强类型枚举 ---
+        netLimit.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0); // 禁用
         SetInformationJobObject(g_hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
 
         CloseHandle(g_hJob);
@@ -372,14 +377,19 @@ private:
 
     bool UpdateNetLimits() {
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimitInfo = { 0 };
-        netLimitInfo.ControlFlags = 0;
+        // --- FIX 3 (continued): 使用 static_cast 进行初始化和位运算 ---
+        netLimitInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
 
         if (netLimit != -1) {
-            netLimitInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
+            netLimitInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(
+                netLimitInfo.ControlFlags | JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH
+            );
             netLimitInfo.MaxBandwidth = (DWORD64)netLimit * 1024;
         }
         if (dscp != -1) {
-            netLimitInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
+            netLimitInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(
+                netLimitInfo.ControlFlags | JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG
+            );
             netLimitInfo.DscpTag = (BYTE)dscp;
         }
 

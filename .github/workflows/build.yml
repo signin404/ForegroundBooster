@@ -1,0 +1,42 @@
+name: Build C++ Process Controller
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create Manifest File
+      run: |
+        echo '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' > ProcessController.exe.manifest
+        echo '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">' >> ProcessController.exe.manifest
+        echo '  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">' >> ProcessController.exe.manifest
+        echo '    <security>' >> ProcessController.exe.manifest
+        echo '      <requestedPrivileges>' >> ProcessController.exe.manifest
+        echo '        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>' >> ProcessController.exe.manifest
+        echo '      </requestedPrivileges>' >> ProcessController.exe.manifest
+        echo '    </security>' >> ProcessController.exe.manifest
+        echo '  </trustInfo>' >> ProcessController.exe.manifest
+        echo '</assembly>' >> ProcessController.exe.manifest
+      shell: cmd
+
+    - name: Compile and Embed Manifest
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+        cl.exe /EHsc /O2 /W3 /Fe:ProcessController.exe ProcessController.cpp kernel32.lib user32.lib psapi.lib /link /SUBSYSTEM:CONSOLE
+        mt.exe -manifest ProcessController.exe.manifest -outputresource:ProcessController.exe;1
+      shell: cmd
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ProcessController
+        path: ProcessController.exe

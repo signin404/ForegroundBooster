@@ -10,14 +10,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
+#include <cstring> // For strcspn
 
-// --- 在代码中直接链接所有需要的库 ---
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// 使用更可靠的 Windows SDK 版本检查
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
 #define JOB_OBJECT_NET_RATE_CONTROL_ENABLE     0x1
@@ -45,7 +44,6 @@ HANDLE g_hConsole = NULL;
 #define COLOR_WARNING 14
 #define COLOR_DEFAULT 7
 
-// 使用 printf 和 char*，完全模仿 ForegroundBooster
 void LogColor(int color, const char* format, ...) {
     SetConsoleTextAttribute(g_hConsole, color);
     va_list args;
@@ -60,17 +58,11 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
     TOKEN_PRIVILEGES tp;
     LUID luid;
-    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
-        CloseHandle(hToken);
-        return false;
-    }
+    if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) { CloseHandle(hToken); return false; }
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
-        CloseHandle(hToken);
-        return false;
-    }
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) { CloseHandle(hToken); return false; }
     CloseHandle(hToken);
     return GetLastError() == ERROR_SUCCESS;
 }
@@ -87,12 +79,8 @@ void EnableAllPrivileges() {
         L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
-        if (EnablePrivilege(priv)) {
-            // printf 的 %ws 格式化符可以正确打印宽字符串
-            LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
-        } else {
-            LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws\n", priv);
-        }
+        if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, "  -> 成功启用: %ws\n", priv);
+        else LogColor(COLOR_WARNING, "  -> 警告: 无法启用 %ws\n", priv);
     }
     printf("----------------------------------------------------\n\n");
 }
@@ -118,9 +106,7 @@ bool ParseAffinityString(const std::string& s, DWORD_PTR& mask) {
             } else {
                 int start_cpu = std::stoi(segment.substr(0, dash_pos));
                 int end_cpu = std::stoi(segment.substr(dash_pos + 1));
-                for (int i = start_cpu; i <= end_cpu; ++i) {
-                    if (i >= 0 && i < sizeof(DWORD_PTR) * 8) mask |= (1ULL << i);
-                }
+                for (int i = start_cpu; i <= end_cpu; ++i) if (i >= 0 && i < sizeof(DWORD_PTR) * 8) mask |= (1ULL << i);
             }
         } catch (...) { return false; }
     }
@@ -204,9 +190,7 @@ public:
         QueryInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
         std::string affinity_str = "已禁用";
-        if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) {
-            std::stringstream ss; ss << "0x" << std::hex << basicInfo.Affinity; affinity_str = ss.str();
-        }
+        if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) { std::stringstream ss; ss << "0x" << std::hex << basicInfo.Affinity; affinity_str = ss.str(); }
         PrintStatusLine("1. 亲和性 (Affinity)", affinity_str);
         std::string priority_str = "已禁用";
         if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) {
@@ -274,8 +258,18 @@ private:
     }
 };
 
+// --- FIX: 创建一个安全的输入函数来替代 std::getline(std::cin, ...) ---
+std::string GetSanitizedInput() {
+    char buffer[512];
+    if (fgets(buffer, sizeof(buffer), stdin)) {
+        // 移除 fgets 读取到的末尾换行符
+        buffer[strcspn(buffer, "\r\n")] = 0;
+        return std::string(buffer);
+    }
+    return "";
+}
+
 int main(int argc, char* argv[]) {
-    // --- 乱码修复：完全照抄 ForegroundBooster 的方法 ---
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
@@ -317,15 +311,13 @@ int main(int argc, char* argv[]) {
     } else {
         while (pids.empty()) {
             printf("请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ");
-            std::string name_input;
-            std::getline(std::cin, name_input);
+            std::string name_input = GetSanitizedInput(); // 使用安全输入函数
             if (!name_input.empty()) {
                 processIdentifier = name_input;
                 pids = FindProcessByName(string_to_wstring(processIdentifier));
             } else {
                 printf("请输入目标进程ID: ");
-                std::string id_input;
-                std::getline(std::cin, id_input);
+                std::string id_input = GetSanitizedInput(); // 使用安全输入函数
                 try {
                     processIdentifier = id_input;
                     pids.push_back(std::stoi(id_input));
@@ -388,15 +380,14 @@ int main(int argc, char* argv[]) {
         while (true) {
             controller.DisplayStatus();
             printf("请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ");
-            std::string choice;
-            std::getline(std::cin, choice);
+            std::string choice = GetSanitizedInput(); // 使用安全输入函数
             if (choice == "1") {
                 printf("新亲和性 (例: 8,10,12-15) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 if (input == "-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);
             } else if (choice == "2") {
                 printf("新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 std::transform(input.begin(), input.end(), input.begin(), ::tolower);
                 if (input == "-1") controller.priority = -1;
                 else if (input == "idle") controller.priority = IDLE_PRIORITY_CLASS;
@@ -407,29 +398,29 @@ int main(int argc, char* argv[]) {
                 else if (input == "realtime") controller.priority = REALTIME_PRIORITY_CLASS;
             } else if (choice == "3") {
                 printf("新调度优先级 (0-9) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 if (input == "-1") controller.scheduling = -1; else controller.scheduling = std::stoi(input);
             } else if (choice == "4") {
                 printf("新时间片权重 (1-9) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 if (input == "-1") controller.weight = -1; else { controller.weight = std::stoi(input); controller.cpuLimit = -1; }
             } else if (choice == "5") {
                 printf("新数据包优先级 (0-63) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 if (input == "-1") controller.dscp = -1; else controller.dscp = std::stoi(input);
             } else if (choice == "6") {
                 printf("新CPU使用率上限 (1-100) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 if (input == "-1") controller.cpuLimit = -1; else { controller.cpuLimit = std::stoi(input); controller.weight = -1; }
             } else if (choice == "7") {
                 printf("新传出带宽上限 (KB/s) 或 -1 禁用: ");
-                std::string input; std::getline(std::cin, input);
+                std::string input = GetSanitizedInput();
                 if (input == "-1") controller.netLimit = -1; else controller.netLimit = std::stoi(input);
             } else if (choice == "exit") {
                 break;
             } else {
-                printf("无效的选择, 请按回车键重试...");
-                std::cin.get();
+                printf("无效的选择, 请按回车键重试...\n");
+                GetSanitizedInput(); // 等待用户按回车
             }
             controller.ApplySettings();
         }

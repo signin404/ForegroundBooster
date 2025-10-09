@@ -12,22 +12,14 @@ jobs:
 
     steps:
     - name: Checkout repository
-      # 此步骤会检出你仓库中的所有文件，包括 ProcessController.exe.manifest
       uses: actions/checkout@v4
-
-    # ------------------------------------------------------------------
-    #  移除了在此处动态创建 manifest 文件的步骤，因为文件已存在
-    # ------------------------------------------------------------------
 
     - name: Compile and Embed Manifest
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
         
-        # 编译 C++ 代码，生成 .exe 文件
         cl.exe /EHsc /O2 /W3 /Fe:ProcessController.exe ProcessController.cpp kernel32.lib user32.lib psapi.lib /link /SUBSYSTEM:CONSOLE
         
-        # 使用 mt.exe 将仓库中已有的 manifest 文件嵌入到 .exe 中
-        # mt.exe 会自动找到当前目录下的 ProcessController.exe.manifest 文件
         mt.exe -manifest ProcessController.exe.manifest -outputresource:ProcessController.exe;1
       shell: cmd
 

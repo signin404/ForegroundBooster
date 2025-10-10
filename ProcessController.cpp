@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <io.h>
 #include <fcntl.h>
+#include <tlhelp32.h>
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
@@ -123,30 +124,23 @@ bool ParseAffinityString(const std::wstring& w_s, DWORD_PTR& mask) {
 
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     std::vector<DWORD> pids;
-    DWORD aProcesses[2048], cbNeeded; // Increased buffer size
-    if (!EnumProcesses(aProcesses, sizeof(aProcesses), &cbNeeded)) return pids;
-    DWORD cProcesses = cbNeeded / sizeof(DWORD);
-    for (unsigned int i = 0; i < cProcesses; i++) {
-        if (aProcesses[i] != 0) {
-            wchar_t szProcessName[MAX_PATH] = L"<unknown>";
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, aProcesses[i]);
-            if (hProcess) {
-                DWORD size = MAX_PATH;
-                if (QueryFullProcessImageNameW(hProcess, 0, szProcessName, &size)) {
-                    std::wstring fullPath(szProcessName);
-                    std::wstring exeName = fullPath.substr(fullPath.find_last_of(L"\\/") + 1);
-                    if (_wcsicmp(exeName.c_str(), processName.c_str()) == 0) {
-                        pids.push_back(aProcesses[i]);
-                    }
-                }
-                CloseHandle(hProcess);
-            }
-        }
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return pids;
     }
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+                pids.push_back(pe32.th32ProcessID);
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
     return pids;
 }
 
-// --- NEW: Function to clear all settings from a job object ---
 void ClearAllJobSettings(HANDLE hJob) {
     JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
     SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
@@ -157,7 +151,6 @@ void ClearAllJobSettings(HANDLE hJob) {
     SetInformationJobObject(hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
 }
 
-// --- MODIFIED: Exit function now keeps restrictions active ---
 void CleanupAndExit() {
     if (g_hJob != NULL && g_hJob != INVALID_HANDLE_VALUE) {
         std::wcout << L"\n正在退出... 限制将保持生效。" << std::endl;
@@ -189,20 +182,16 @@ public:
     void DisplayStatus() {
         system("cls");
         std::wcout << L"--- 进程控制器菜单 ---\n";
-        // --- NEW: Added unlock option to menu ---
         PrintStatusLine(L"-1. 禁用所有限制", L"");
-
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
-        
         std::wstringstream wss;
         wss << L"0x" << std::hex << basicInfo.Affinity;
         PrintStatusLine(L"1. 亲和性 (Affinity)", (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) ? wss.str() : L"已禁用");
-        
         std::wstring priority_str = L"已禁用";
         if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) {
             switch (basicInfo.PriorityClass) {
@@ -220,7 +209,6 @@ public:
         PrintStatusLine(L"5. 数据包优先级 (DSCP)", ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) ? std::to_wstring(netInfo.DscpTag) : L"已禁用");
         PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", ((cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) && (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE)) ? (std::to_wstring(cpuInfo.CpuRate / 100) + L"%") : L"已禁用");
         PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) ? (std::to_wstring(netInfo.MaxBandwidth / 1024) + L" KB/s") : L"已禁用");
-        
         std::wcout << L"----------------------------------------------------\n";
     }
     DWORD_PTR affinity = 0;
@@ -283,19 +271,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::vector<DWORD> pids;
-    std::wstring processIdentifier;
-    bool isInputByName = false; // --- NEW: Flag to track input type ---
+    // --- FIX: Use a dedicated variable for the job object identifier ---
+    std::wstring jobIdentifier; 
+    bool isInputByName = false;
 
     if (isOneShotMode) {
         if (args.count("processname")) {
             isInputByName = true;
             std::string narrow_id = args["processname"];
-            processIdentifier.assign(narrow_id.begin(), narrow_id.end());
-            pids = FindProcessByName(processIdentifier);
+            jobIdentifier.assign(narrow_id.begin(), narrow_id.end());
+            pids = FindProcessByName(jobIdentifier);
         } else if (args.count("processid")) {
             isInputByName = false;
             std::string narrow_id = args["processid"];
-            processIdentifier.assign(narrow_id.begin(), narrow_id.end());
+            jobIdentifier.assign(narrow_id.begin(), narrow_id.end());
             try { pids.push_back(std::stoi(narrow_id)); } catch(...) {}
         } else {
             std::wcerr << L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。" << std::endl;
@@ -308,15 +297,15 @@ int main(int argc, char* argv[]) {
             std::getline(std::wcin, name_input);
             if (!name_input.empty()) {
                 isInputByName = true;
-                processIdentifier = name_input;
-                pids = FindProcessByName(processIdentifier);
+                jobIdentifier = name_input; // Use the name as the identifier
+                pids = FindProcessByName(jobIdentifier);
             } else {
                 isInputByName = false;
                 std::wcout << L"请输入目标进程ID: ";
                 std::wstring id_input;
                 std::getline(std::wcin, id_input);
                 try {
-                    processIdentifier = id_input;
+                    jobIdentifier = id_input; // Use the ID as the identifier
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
@@ -330,12 +319,11 @@ int main(int argc, char* argv[]) {
     std::wcout << L"已找到 " << pids.size() << L" 个目标进程:" << std::endl;
     for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
     
-    // --- NEW: Differentiated Job Object Naming ---
     std::wstring jobName;
     if (isInputByName) {
-        jobName = L"Global\\ProcessControllerJob_Name_" + processIdentifier;
+        jobName = L"Global\\ProcessControllerJob_Name_" + jobIdentifier;
     } else {
-        jobName = L"Global\\ProcessControllerJob_PID_" + processIdentifier;
+        jobName = L"Global\\ProcessControllerJob_PID_" + jobIdentifier;
     }
 
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
@@ -383,13 +371,15 @@ int main(int argc, char* argv[]) {
     } else {
         while (true) {
             controller.DisplayStatus();
-            std::wcout << L"请选择要修改的功能 (-1, 1-7), 或输入 'exit' 自动解锁并退出: ";
+            std::wcout << L"请选择要修改的功能 (-1, 1-7), 或输入 'exit' 退出: ";
             std::wstring choice;
             std::getline(std::wcin, choice);
             if (choice == L"-1") {
                 ClearAllJobSettings(g_hJob);
-                LogColor(COLOR_SUCCESS, L"所有限制已成功禁用！程序将退出。\n");
-                break;
+                LogColor(COLOR_SUCCESS, L"所有限制已成功禁用！\n");
+                std::wcout << L"按回车键继续...";
+                std::wstring dummy;
+                std::getline(std::wcin, dummy);
             } else if (choice == L"1") {
                 std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);

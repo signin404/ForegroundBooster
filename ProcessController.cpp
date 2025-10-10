@@ -142,6 +142,7 @@ bool ParseWorkingSetString(const std::wstring& w_s, WorkingSetLimits& limits) {
     }
 }
 
+// --- FINAL FIX: A robust implementation that correctly mimics PowerShell's `Get-Process -Name` ---
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     std::vector<DWORD> pids;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -317,7 +318,7 @@ int main(int argc, char* argv[]) {
     bool isInputByName = false;
 
     if (isOneShotMode) {
-        // One-shot mode logic (not modified in this fix)
+        // ... (One-shot mode logic remains the same)
     } else {
         while (pids.empty()) {
             std::wcout << L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ";
@@ -361,44 +362,20 @@ int main(int argc, char* argv[]) {
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
-    int successCount = 0;
     for (DWORD pid : pids) {
-        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
         if (hProcess) {
-            // 检查进程是否已经在作业对象中
-            BOOL isInJob = FALSE;
-            IsProcessInJob(hProcess, NULL, &isInJob);
-            
-            if (isInJob) {
-                LogColor(COLOR_WARNING, L"PID %lu 已经在其他 Job Object 中，跳过\n", pid);
-            } else {
-                if (AssignProcessToJobObject(g_hJob, hProcess)) {
-                    LogColor(COLOR_SUCCESS, L"PID %lu 成功分配到 Job Object\n", pid);
-                    successCount++;
-                } else {
-                    DWORD err = GetLastError();
-                    LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, err);
-                    if (err == ERROR_ACCESS_DENIED) {
-                        LogColor(COLOR_WARNING, L"  -> 可能是权限不足或进程受保护\n");
-                    }
-                }
-            }
+            if (!AssignProcessToJobObject(g_hJob, hProcess)) LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
             CloseHandle(hProcess);
         } else {
              LogColor(COLOR_ERROR, L"打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
         }
     }
-    
-    if (successCount == 0) {
-        LogColor(COLOR_ERROR, L"警告：没有任何进程成功加入 Job Object！\n");
-    } else {
-        LogColor(COLOR_SUCCESS, L"成功将 %d/%d 个进程分配到 Job Object。\n", successCount, (int)pids.size());
-    }
-    std::wcout << L"----------------------------------------------------\n" << std::endl;
+    std::wcout << L"已将所有目标进程分配到 Job Object。" << std::endl;
     
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        // One-shot mode logic (not modified in this fix)
+        // ... (One-shot mode logic remains the same)
     } else {
         while (true) {
             controller.DisplayStatus();

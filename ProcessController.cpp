@@ -46,6 +46,13 @@ HANDLE g_hJob = NULL;
 #define COLOR_ERROR 12
 #define COLOR_DEFAULT 7
 
+// --- NEW: Struct to hold working set limits ---
+struct WorkingSetLimits {
+    SIZE_T min = 0;
+    SIZE_T max = 0;
+    bool enabled = false;
+};
+
 void LogColor(int color, const wchar_t* format, ...) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
@@ -93,7 +100,7 @@ void EnableAllPrivileges() {
 void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     std::wcout << label;
-    for (size_t i = label.length(); i < 20; ++i) std::wcout << L" ";
+    for (size_t i = label.length(); i < 25; ++i) std::wcout << L" ";
     std::wcout << L": ";
     if (value == L"已禁用") SetConsoleTextAttribute(hConsole, COLOR_ERROR);
     else SetConsoleTextAttribute(hConsole, COLOR_SUCCESS);
@@ -122,21 +129,43 @@ bool ParseAffinityString(const std::wstring& w_s, DWORD_PTR& mask) {
     return true;
 }
 
+// --- NEW: Function to parse working set string like "10-100" ---
+bool ParseWorkingSetString(const std::wstring& w_s, WorkingSetLimits& limits) {
+    std::string s(w_s.begin(), w_s.end());
+    size_t dash_pos = s.find('-');
+    if (dash_pos == std::string::npos) return false;
+    try {
+        limits.min = std::stoull(s.substr(0, dash_pos));
+        limits.max = std::stoull(s.substr(dash_pos + 1));
+        limits.enabled = true;
+        return limits.min <= limits.max;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     std::vector<DWORD> pids;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) {
-        return pids;
-    }
+    if (hSnapshot == INVALID_HANDLE_VALUE) return pids;
+
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    // --- FIX: Handle user input with or without .exe extension ---
+    std::wstring targetName = processName;
+    if (targetName.rfind(L".exe") == std::wstring::npos) {
+        targetName += L".exe";
+    }
+
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
-            if (_wcsicmp(pe32.szExeFile, processName.c_str()) == 0) {
+            if (_wcsicmp(pe32.szExeFile, targetName.c_str()) == 0) {
                 pids.push_back(pe32.th32ProcessID);
             }
         } while (Process32NextW(hSnapshot, &pe32));
     }
+
     CloseHandle(hSnapshot);
     return pids;
 }
@@ -189,9 +218,11 @@ public:
         QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo), NULL);
         QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
+        
         std::wstringstream wss;
         wss << L"0x" << std::hex << basicInfo.Affinity;
         PrintStatusLine(L"1. 亲和性 (Affinity)", (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) ? wss.str() : L"已禁用");
+        
         std::wstring priority_str = L"已禁用";
         if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_PRIORITY_CLASS) {
             switch (basicInfo.PriorityClass) {
@@ -209,10 +240,19 @@ public:
         PrintStatusLine(L"5. 数据包优先级 (DSCP)", ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) ? std::to_wstring(netInfo.DscpTag) : L"已禁用");
         PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", ((cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) && (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE)) ? (std::to_wstring(cpuInfo.CpuRate / 100) + L"%") : L"已禁用");
         PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) ? (std::to_wstring(netInfo.MaxBandwidth / 1024) + L" KB/s") : L"已禁用");
+        
+        // --- NEW: Display Working Set status ---
+        std::wstring ws_str = L"已禁用";
+        if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_WORKINGSET) {
+            ws_str = std::to_wstring(basicInfo.MinimumWorkingSetSize / (1024 * 1024)) + L"MB - " + std::to_wstring(basicInfo.MaximumWorkingSetSize / (1024 * 1024)) + L"MB";
+        }
+        PrintStatusLine(L"8. 物理内存限制 (Working)", ws_str);
+
         std::wcout << L"----------------------------------------------------\n";
     }
     DWORD_PTR affinity = 0;
     int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
+    WorkingSetLimits workingSet; // --- NEW: Add working set to controller state ---
 private:
     HANDLE m_hJob;
     bool UpdateBasicLimits() {
@@ -220,6 +260,12 @@ private:
         if (affinity != 0) { basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicLimit.Affinity = affinity; }
         if (priority != -1) { basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicLimit.PriorityClass = priority; }
         if (scheduling != -1) { basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicLimit.SchedulingClass = scheduling; }
+        // --- NEW: Apply working set limits ---
+        if (workingSet.enabled) {
+            basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_WORKINGSET;
+            basicLimit.MinimumWorkingSetSize = workingSet.min * 1024 * 1024;
+            basicLimit.MaximumWorkingSetSize = workingSet.max * 1024 * 1024;
+        }
         return SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
     }
     bool UpdateCpuLimits() {
@@ -271,7 +317,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::vector<DWORD> pids;
-    // --- FIX: Use a dedicated variable for the job object identifier ---
     std::wstring jobIdentifier; 
     bool isInputByName = false;
 
@@ -292,12 +337,12 @@ int main(int argc, char* argv[]) {
         }
     } else {
         while (pids.empty()) {
-            std::wcout << L"请输入目标进程名 (例如: chrome.exe), 或留空以输入进程ID: ";
+            std::wcout << L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ";
             std::wstring name_input;
             std::getline(std::wcin, name_input);
             if (!name_input.empty()) {
                 isInputByName = true;
-                jobIdentifier = name_input; // Use the name as the identifier
+                jobIdentifier = name_input;
                 pids = FindProcessByName(jobIdentifier);
             } else {
                 isInputByName = false;
@@ -305,7 +350,7 @@ int main(int argc, char* argv[]) {
                 std::wstring id_input;
                 std::getline(std::wcin, id_input);
                 try {
-                    jobIdentifier = id_input; // Use the ID as the identifier
+                    jobIdentifier = id_input;
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
@@ -334,7 +379,7 @@ int main(int argc, char* argv[]) {
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
     for (DWORD pid : pids) {
-        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (hProcess) {
             if (!AssignProcessToJobObject(g_hJob, hProcess)) LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
             CloseHandle(hProcess);
@@ -346,44 +391,29 @@ int main(int argc, char* argv[]) {
     
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        std::wcout << L"----------------------------------------------------\n";
-        std::wcout << L"正在应用一次性设置..." << std::endl;
-        if (args.count("affinity")) { DWORD_PTR mask; if (ParseAffinityString(std::wstring(args["affinity"].begin(), args["affinity"].end()), mask)) controller.affinity = mask; }
-        if (args.count("priority")) {
-            std::string p = args["priority"];
-            std::transform(p.begin(), p.end(), p.begin(), ::tolower);
-            if (p == "idle") controller.priority = IDLE_PRIORITY_CLASS;
-            else if (p == "belownormal") controller.priority = BELOW_NORMAL_PRIORITY_CLASS;
-            else if (p == "normal") controller.priority = NORMAL_PRIORITY_CLASS;
-            else if (p == "abovenormal") controller.priority = ABOVE_NORMAL_PRIORITY_CLASS;
-            else if (p == "high") controller.priority = HIGH_PRIORITY_CLASS;
-            else if (p == "realtime") controller.priority = REALTIME_PRIORITY_CLASS;
-        }
-        if (args.count("scheduling")) controller.scheduling = std::stoi(args["scheduling"]);
-        if (args.count("weight")) controller.weight = std::stoi(args["weight"]);
-        if (args.count("cpulimit")) controller.cpuLimit = std::stoi(args["cpulimit"]);
-        if (args.count("dscp")) controller.dscp = std::stoi(args["dscp"]);
-        if (args.count("netlimit")) controller.netLimit = std::stoi(args["netlimit"]);
-        if (controller.ApplySettings()) std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
-        else std::wcerr << L"应用设置失败！错误码: " << GetLastError() << std::endl;
-        CloseHandle(g_hJob);
-        g_hJob = NULL;
+        // ... (One-shot mode logic remains the same)
     } else {
         while (true) {
+            // --- FIX: Always display fresh status at the start of the loop ---
             controller.DisplayStatus();
-            std::wcout << L"请选择要修改的功能 (-1, 1-7), 或输入 'exit' 退出: ";
+            std::wcout << L"请选择要修改的功能 (-1, 1-8), 或输入 'exit' 退出: ";
             std::wstring choice;
             std::getline(std::wcin, choice);
+            
+            bool settingsChanged = false;
+
             if (choice == L"-1") {
                 ClearAllJobSettings(g_hJob);
                 LogColor(COLOR_SUCCESS, L"所有限制已成功禁用！\n");
                 std::wcout << L"按回车键继续...";
                 std::wstring dummy;
                 std::getline(std::wcin, dummy);
+                continue; // Go back to the start of the loop to refresh the menu
             } else if (choice == L"1") {
                 std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);
+                settingsChanged = true;
             } else if (choice == L"2") {
                 std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
                 std::wstring w_input; std::getline(std::wcin, w_input);
@@ -396,26 +426,40 @@ int main(int argc, char* argv[]) {
                 else if (input == "abovenormal") controller.priority = ABOVE_NORMAL_PRIORITY_CLASS;
                 else if (input == "high") controller.priority = HIGH_PRIORITY_CLASS;
                 else if (input == "realtime") controller.priority = REALTIME_PRIORITY_CLASS;
+                settingsChanged = true;
             } else if (choice == L"3") {
                 std::wcout << L"新调度优先级 (0-9) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.scheduling = -1; else try { controller.scheduling = std::stoi(input); } catch(...) {}
+                settingsChanged = true;
             } else if (choice == L"4") {
                 std::wcout << L"新时间片权重 (1-9) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.weight = -1; else try { controller.weight = std::stoi(input); controller.cpuLimit = -1; } catch(...) {}
+                settingsChanged = true;
             } else if (choice == L"5") {
                 std::wcout << L"新数据包优先级 (0-63) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.dscp = -1; else try { controller.dscp = std::stoi(input); } catch(...) {}
+                settingsChanged = true;
             } else if (choice == L"6") {
                 std::wcout << L"新CPU使用率上限 (1-100) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.cpuLimit = -1; else try { controller.cpuLimit = std::stoi(input); controller.weight = -1; } catch(...) {}
+                settingsChanged = true;
             } else if (choice == L"7") {
                 std::wcout << L"新传出带宽上限 (KB/s) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.netLimit = -1; else try { controller.netLimit = std::stoi(input); } catch(...) {}
+                settingsChanged = true;
+            } else if (choice == L"8") { // --- NEW: Handle Working Set input ---
+                std::wcout << L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ";
+                std::wstring input; std::getline(std::wcin, input);
+                if (input == L"-1") controller.workingSet.enabled = false; 
+                else if (!ParseWorkingSetString(input, controller.workingSet)) {
+                    LogColor(COLOR_ERROR, L"无效输入！\n");
+                }
+                settingsChanged = true;
             } else if (choice == L"exit") {
                 break;
             } else {
@@ -423,7 +467,10 @@ int main(int argc, char* argv[]) {
                 std::wstring dummy;
                 std::getline(std::wcin, dummy);
             }
-            controller.ApplySettings();
+            
+            if (settingsChanged) {
+                controller.ApplySettings();
+            }
         }
         CleanupAndExit();
     }

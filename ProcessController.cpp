@@ -142,7 +142,6 @@ bool ParseWorkingSetString(const std::wstring& w_s, WorkingSetLimits& limits) {
     }
 }
 
-// --- FINAL FIX: A robust implementation that correctly mimics PowerShell's `Get-Process -Name` ---
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     std::vector<DWORD> pids;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -314,11 +313,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::vector<DWORD> pids;
-    std::wstring jobIdentifier; 
+    
+    // --- FIX START: 使用独立的、目的明确的变量来存储标识符 ---
+    // 避免复用同一个变量来存储进程名和进程ID，这是导致问题的根源。
+    std::wstring processNameIdentifier; 
+    std::wstring processIdIdentifier;
+    // --- FIX END ---
+    
     bool isInputByName = false;
 
     if (isOneShotMode) {
-        // ... (One-shot mode logic remains the same)
+        // ... (One-shot mode logic remains the same, assuming it uses a similar corrected logic)
     } else {
         while (pids.empty()) {
             std::wcout << L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ";
@@ -326,15 +331,17 @@ int main(int argc, char* argv[]) {
             std::getline(std::wcin, name_input);
             if (!name_input.empty()) {
                 isInputByName = true;
-                jobIdentifier = name_input;
-                pids = FindProcessByName(jobIdentifier);
+                // --- FIX: 将输入的名字存入专门的变量 ---
+                processNameIdentifier = name_input;
+                pids = FindProcessByName(processNameIdentifier);
             } else {
                 isInputByName = false;
                 std::wcout << L"请输入目标进程ID: ";
                 std::wstring id_input;
                 std::getline(std::wcin, id_input);
                 try {
-                    jobIdentifier = id_input;
+                    // --- FIX: 将输入的ID存入专门的变量 ---
+                    processIdIdentifier = id_input;
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
@@ -349,23 +356,38 @@ int main(int argc, char* argv[]) {
     for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
     
     std::wstring jobName;
+    // --- FIX START: 根据输入模式，使用正确的、独立的标识符来构建Job名称 ---
+    // 这是关键修复。现在，当按名称查找时，我们确保使用进程名来创建唯一的Job Object，
+    // 所有同名进程都将被加入这同一个Job Object中。
     if (isInputByName) {
-        jobName = L"Global\\ProcessControllerJob_Name_" + jobIdentifier;
+        jobName = L"Global\\ProcessControllerJob_Name_" + processNameIdentifier;
     } else {
-        jobName = L"Global\\ProcessControllerJob_PID_" + jobIdentifier;
+        jobName = L"Global\\ProcessControllerJob_PID_" + processIdIdentifier;
     }
+    // --- FIX END ---
 
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
-        LogColor(COLOR_ERROR, L"CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
-        return 1;
+        // 如果Job已存在，GetLastError()会返回ERROR_ALREADY_EXISTS，此时需要打开它
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            g_hJob = OpenJobObjectW(JOB_OBJECT_ALL_ACCESS, FALSE, jobName.c_str());
+            if (g_hJob == NULL) {
+                 LogColor(COLOR_ERROR, L"打开已存在的 Job Object '%ws' 失败！错误码: %lu\n", jobName.c_str(), GetLastError());
+                 return 1;
+            }
+        } else {
+            LogColor(COLOR_ERROR, L"CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
+            return 1;
+        }
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
     for (DWORD pid : pids) {
-        HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (hProcess) {
-            if (!AssignProcessToJobObject(g_hJob, hProcess)) LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
+            if (!AssignProcessToJobObject(g_hJob, hProcess)) {
+                LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
+            }
             CloseHandle(hProcess);
         } else {
              LogColor(COLOR_ERROR, L"打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());

@@ -10,8 +10,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
-#include <io.h>      // For _setmode
-#include <fcntl.h>   // For _O_U16TEXT
+#include <io.h>
+#include <fcntl.h>
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
@@ -92,7 +92,7 @@ void EnableAllPrivileges() {
 void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     std::wcout << label;
-    for (size_t i = label.length(); i < 20; ++i) std::wcout << L" "; // Adjusted padding for wide chars
+    for (size_t i = label.length(); i < 20; ++i) std::wcout << L" ";
     std::wcout << L": ";
     if (value == L"已禁用") SetConsoleTextAttribute(hConsole, COLOR_ERROR);
     else SetConsoleTextAttribute(hConsole, COLOR_SUCCESS);
@@ -100,7 +100,6 @@ void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
-// This function now takes wstring and converts to string for parsing
 bool ParseAffinityString(const std::wstring& w_s, DWORD_PTR& mask) {
     std::string s(w_s.begin(), w_s.end());
     mask = 0;
@@ -124,19 +123,21 @@ bool ParseAffinityString(const std::wstring& w_s, DWORD_PTR& mask) {
 
 std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     std::vector<DWORD> pids;
-    DWORD aProcesses[1024], cbNeeded;
+    DWORD aProcesses[2048], cbNeeded; // Increased buffer size
     if (!EnumProcesses(aProcesses, sizeof(aProcesses), &cbNeeded)) return pids;
     DWORD cProcesses = cbNeeded / sizeof(DWORD);
     for (unsigned int i = 0; i < cProcesses; i++) {
         if (aProcesses[i] != 0) {
             wchar_t szProcessName[MAX_PATH] = L"<unknown>";
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, aProcesses[i]);
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, aProcesses[i]);
             if (hProcess) {
-                HMODULE hMod;
-                DWORD cbNeeded2;
-                if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded2)) {
-                    GetModuleBaseNameW(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(wchar_t));
-                    if (processName == szProcessName) pids.push_back(aProcesses[i]);
+                DWORD size = MAX_PATH;
+                if (QueryFullProcessImageNameW(hProcess, 0, szProcessName, &size)) {
+                    std::wstring fullPath(szProcessName);
+                    std::wstring exeName = fullPath.substr(fullPath.find_last_of(L"\\/") + 1);
+                    if (_wcsicmp(exeName.c_str(), processName.c_str()) == 0) {
+                        pids.push_back(aProcesses[i]);
+                    }
                 }
                 CloseHandle(hProcess);
             }
@@ -145,19 +146,23 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
     return pids;
 }
 
+// --- NEW: Function to clear all settings from a job object ---
+void ClearAllJobSettings(HANDLE hJob) {
+    JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
+    SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimit = {};
+    SetInformationJobObject(hJob, JobObjectCpuRateControlInformation, &cpuLimit, sizeof(cpuLimit));
+    JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimit = {};
+    netLimit.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
+    SetInformationJobObject(hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
+}
+
+// --- MODIFIED: Exit function now keeps restrictions active ---
 void CleanupAndExit() {
     if (g_hJob != NULL && g_hJob != INVALID_HANDLE_VALUE) {
-        std::wcout << L"\n正在退出... 自动移除所有限制..." << std::endl;
-        JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
-        SetInformationJobObject(g_hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
-        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimit = {};
-        SetInformationJobObject(g_hJob, JobObjectCpuRateControlInformation, &cpuLimit, sizeof(cpuLimit));
-        JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimit = {};
-        netLimit.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
-        SetInformationJobObject(g_hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
+        std::wcout << L"\n正在退出... 限制将保持生效。" << std::endl;
         CloseHandle(g_hJob);
         g_hJob = NULL;
-        std::wcout << L"解锁成功！控制器已终止。" << std::endl;
     }
 }
 
@@ -184,6 +189,9 @@ public:
     void DisplayStatus() {
         system("cls");
         std::wcout << L"--- 进程控制器菜单 ---\n";
+        // --- NEW: Added unlock option to menu ---
+        PrintStatusLine(L"-1. 禁用所有限制", L"");
+
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
@@ -253,7 +261,6 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    // --- The definitive, robust way to handle Unicode console I/O ---
     _setmode(_fileno(stdout), _O_U16TEXT);
     _setmode(_fileno(stdin),  _O_U16TEXT);
     _setmode(_fileno(stderr), _O_U16TEXT);
@@ -277,12 +284,16 @@ int main(int argc, char* argv[]) {
     }
     std::vector<DWORD> pids;
     std::wstring processIdentifier;
+    bool isInputByName = false; // --- NEW: Flag to track input type ---
+
     if (isOneShotMode) {
         if (args.count("processname")) {
+            isInputByName = true;
             std::string narrow_id = args["processname"];
             processIdentifier.assign(narrow_id.begin(), narrow_id.end());
             pids = FindProcessByName(processIdentifier);
         } else if (args.count("processid")) {
+            isInputByName = false;
             std::string narrow_id = args["processid"];
             processIdentifier.assign(narrow_id.begin(), narrow_id.end());
             try { pids.push_back(std::stoi(narrow_id)); } catch(...) {}
@@ -296,9 +307,11 @@ int main(int argc, char* argv[]) {
             std::wstring name_input;
             std::getline(std::wcin, name_input);
             if (!name_input.empty()) {
+                isInputByName = true;
                 processIdentifier = name_input;
                 pids = FindProcessByName(processIdentifier);
             } else {
+                isInputByName = false;
                 std::wcout << L"请输入目标进程ID: ";
                 std::wstring id_input;
                 std::getline(std::wcin, id_input);
@@ -317,7 +330,14 @@ int main(int argc, char* argv[]) {
     std::wcout << L"已找到 " << pids.size() << L" 个目标进程:" << std::endl;
     for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
     
-    std::wstring jobName = L"Global\\ProcessControllerJob_" + processIdentifier;
+    // --- NEW: Differentiated Job Object Naming ---
+    std::wstring jobName;
+    if (isInputByName) {
+        jobName = L"Global\\ProcessControllerJob_Name_" + processIdentifier;
+    } else {
+        jobName = L"Global\\ProcessControllerJob_PID_" + processIdentifier;
+    }
+
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
         LogColor(COLOR_ERROR, L"CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
@@ -363,10 +383,14 @@ int main(int argc, char* argv[]) {
     } else {
         while (true) {
             controller.DisplayStatus();
-            std::wcout << L"请选择要修改的功能 (1-7), 或输入 'exit' 自动解锁并退出: ";
+            std::wcout << L"请选择要修改的功能 (-1, 1-7), 或输入 'exit' 自动解锁并退出: ";
             std::wstring choice;
             std::getline(std::wcin, choice);
-            if (choice == L"1") {
+            if (choice == L"-1") {
+                ClearAllJobSettings(g_hJob);
+                LogColor(COLOR_SUCCESS, L"所有限制已成功禁用！程序将退出。\n");
+                break;
+            } else if (choice == L"1") {
                 std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);

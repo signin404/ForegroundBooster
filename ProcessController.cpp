@@ -101,7 +101,6 @@ void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
-// --- FIX: Now handles both space and comma delimiters ---
 bool ParseAffinityString(std::wstring w_s, DWORD_PTR& mask) {
     std::replace(w_s.begin(), w_s.end(), L' ', L',');
     std::string s(w_s.begin(), w_s.end());
@@ -125,17 +124,13 @@ bool ParseAffinityString(std::wstring w_s, DWORD_PTR& mask) {
     return true;
 }
 
-// --- FIX: Now handles inputs with or without .exe ---
 std::vector<DWORD> FindProcessByName(std::wstring processName) {
     std::vector<DWORD> pids;
-    // Ensure the process name ends with .exe for comparison
     if (processName.length() < 4 || _wcsicmp(processName.substr(processName.length() - 4).c_str(), L".exe") != 0) {
         processName += L".exe";
     }
-
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return pids;
-    
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
     if (Process32FirstW(hSnapshot, &pe32)) {
@@ -182,14 +177,11 @@ class JobController {
 public:
     JobController(HANDLE hJob) : m_hJob(hJob) {}
 
-    // --- FIX: This function now applies settings based on current state ---
     bool ApplySettings(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet) {
         bool success = true;
-
-        // Basic Limits (Affinity, Priority, Scheduling, WorkingSet)
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo), NULL);
-        basicInfo.LimitFlags = 0; // Reset flags to apply only what's needed
+        basicInfo.LimitFlags = 0;
         if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; }
         if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; }
         if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; }
@@ -200,7 +192,6 @@ public:
         }
         if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) success = false;
 
-        // CPU Limits (Weight, CpuLimit)
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
         if (weight != -1) {
             cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
@@ -211,20 +202,17 @@ public:
         }
         if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) success = false;
 
-        // Network Limits (DSCP)
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
         netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
         if (dscp != -1) {
             netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(netInfo.ControlFlags | JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
             netInfo.DscpTag = (BYTE)dscp;
         }
-        // Note: NetLimit (bandwidth) is not implemented in this version as it was removed from the menu.
         if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) success = false;
         
         return success;
     }
 
-    // --- FIX: This function now ALWAYS queries the system for the current state ---
     void DisplayStatus() {
         system("cls");
         std::wcout << L"--- 进程控制器菜单 ---\n";
@@ -261,14 +249,16 @@ public:
         if (basicInfo.LimitFlags & JOB_OBJECT_LIMIT_WORKINGSET) {
             workingSet_str = std::to_wstring(basicInfo.MinimumWorkingSetSize / 1024 / 1024) + L"MB - " + std::to_wstring(basicInfo.MaximumWorkingSetSize / 1024 / 1024) + L"MB";
         }
-        // --- NEW: Added WorkingSet to the menu ---
         PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", workingSet_str);
         
         std::wcout << L"----------------------------------------------------\n";
     }
+
+private:
+    // --- FIX: Added the missing member variable declaration ---
+    HANDLE m_hJob;
 };
 
-// --- FIX: Use wmain to correctly handle Unicode command-line arguments ---
 int wmain(int argc, wchar_t* argv[]) {
     _setmode(_fileno(stdout), _O_U16TEXT);
     _setmode(_fileno(stdin),  _O_U16TEXT);
@@ -416,6 +406,7 @@ int wmain(int argc, wchar_t* argv[]) {
                 std::wcout << L"按回车键继续...";
                 std::wstring dummy;
                 std::getline(std::wcin, dummy);
+                continue; // Go back to the start of the loop to refresh the display
             } else if (choice == L"1") {
                 std::wcout << L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
@@ -466,7 +457,7 @@ int wmain(int argc, wchar_t* argv[]) {
                 std::wcout << L"无效的选择, 请按回车键重试...";
                 std::wstring dummy;
                 std::getline(std::wcin, dummy);
-                continue; // Skip applying settings on invalid input
+                continue;
             }
             controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet);
         }

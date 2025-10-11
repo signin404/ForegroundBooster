@@ -41,7 +41,6 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 std::vector<HANDLE> g_hJobs;
 bool g_ConsoleAttached = false;
 
-// --- FIX: Define RGB Colors ---
 #define COLOR_LABEL_R 38
 #define COLOR_LABEL_G 160
 #define COLOR_LABEL_B 218
@@ -64,7 +63,6 @@ void SafeWriteConsole(const std::wstring& text) {
     WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), text.length(), &charsWritten, NULL);
 }
 
-// --- FIX: New functions for RGB color support ---
 void SetConsoleColorRGB(int r, int g, int b) {
     if (!g_ConsoleAttached) return;
     wchar_t color_buffer[64];
@@ -77,7 +75,7 @@ void ResetConsoleColor() {
     SafeWriteConsole(L"\x1b[0m");
 }
 
-void LogColor(int color, const wchar_t* format, ...) {
+void LogColor(const wchar_t* format, ...) {
     if (!g_ConsoleAttached) return;
     wchar_t buffer[2048];
     va_list args;
@@ -128,17 +126,16 @@ void EnableAllPrivileges() {
     for (const auto& priv : privileges) {
         if (EnablePrivilege(priv)) {
             SetConsoleColorRGB(COLOR_SUCCESS_R, COLOR_SUCCESS_G, COLOR_SUCCESS_B);
-            LogColor(0, L"  -> 成功启用: %ws\n", priv);
+            LogColor(L"  -> 成功启用: %ws\n", priv);
         } else {
             SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
-            LogColor(0, L"  -> 警告: 无法启用 %ws\n", priv);
+            LogColor(L"  -> 警告: 无法启用 %ws\n", priv);
         }
         ResetConsoleColor();
     }
     SafeWriteConsole(L"----------------------------------------------------\n\n");
 }
 
-// FIX: Rewritten to use RGB colors and new format.
 void PrintStatusLine(const std::wstring& label, const std::wstring& value, int successCount = -1, int failCount = -1) {
     SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
     std::wstring paddedLabel = label;
@@ -167,7 +164,6 @@ void PrintStatusLine(const std::wstring& label, const std::wstring& value, int s
     SafeWriteConsole(L"\n");
 }
 
-// FIX: New function to convert affinity mask to a human-readable string.
 std::wstring MaskToAffinityString(DWORD_PTR mask) {
     if (mask == 0) return L"已禁用";
     std::wstringstream wss;
@@ -275,11 +271,11 @@ class JobController {
 public:
     JobController() {}
 
-    static void ApplySettingsToAll(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet, int& successCount, int& failCount) {
+    static void ApplySettingsToAll(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, int netLimit, const std::pair<size_t, size_t>& workingSet, int& successCount, int& failCount) {
         successCount = 0;
         failCount = 0;
         for (HANDLE hJob : g_hJobs) {
-            if (ApplySettingsToSingle(hJob, affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
+            if (ApplySettingsToSingle(hJob, affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet)) {
                 successCount++;
             } else {
                 failCount++;
@@ -287,7 +283,7 @@ public:
         }
     }
 
-    static bool ApplySettingsToSingle(HANDLE m_hJob, DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet) {
+    static bool ApplySettingsToSingle(HANDLE m_hJob, DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, int netLimit, const std::pair<size_t, size_t>& workingSet) {
         bool overallSuccess = true;
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {}; 
         bool applyBasicLimits = false;
@@ -321,10 +317,18 @@ public:
             }
         }
 
-        if (dscp != -1) {
+        // FIX: Re-integrated NetLimit logic, combined with DSCP
+        if (dscp != -1 || netLimit != -1) {
             JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
-            netInfo.DscpTag = (BYTE)dscp;
+            netInfo.ControlFlags = 0;
+            if (netLimit != -1) {
+                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
+                netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
+            }
+            if (dscp != -1) {
+                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
+                netInfo.DscpTag = (BYTE)dscp;
+            }
             if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
                 overallSuccess = false;
             }
@@ -349,7 +353,6 @@ public:
         SafeWriteConsole(L"--- 进程控制器菜单 ---\n");
         ResetConsoleColor();
         
-        // FIX: "0" option with no colon
         SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
         std::wstring disableLabel = L"0. 禁用所有限制";
         for (size_t i = disableLabel.length(); i < 27; ++i) disableLabel += L" ";
@@ -370,13 +373,7 @@ public:
                 }
             }
             
-            int otherValuesCount = 0;
-            for (const auto& pair : valueCounts) {
-                if (pair.first != mostCommon.first) {
-                    otherValuesCount++;
-                }
-            }
-            if (otherValuesCount > 0) {
+            if (valueCounts.size() > 1) {
                  mostCommon.first = L"混合值";
             }
 
@@ -463,6 +460,18 @@ public:
         auto commonCpuLimit = findMostCommon(counts);
         PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", commonCpuLimit.first, counts[commonCpuLimit.first], g_hJobs.size() - counts[commonCpuLimit.first]);
 
+        // 7. NetLimit
+        counts.clear();
+        for (HANDLE hJob : g_hJobs) {
+            JOBOBJECT_NET_RATE_CONTROL_INFORMATION info = {};
+            QueryInformationJobObject(hJob, JobObjectNetRateControlInformation, &info, sizeof(info), NULL);
+            if ((info.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && (info.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_ENABLE)) {
+                counts[std::to_wstring(info.MaxBandwidth / 1024) + L" KB/s"]++;
+            } else { counts[L"已禁用"]++; }
+        }
+        auto commonNetLimit = findMostCommon(counts);
+        PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", commonNetLimit.first, counts[commonNetLimit.first], g_hJobs.size() - counts[commonNetLimit.first]);
+
         // 8. WorkingSet
         counts.clear();
         for (HANDLE hJob : g_hJobs) {
@@ -479,6 +488,48 @@ public:
     }
 };
 
+// FIX: New function to display command-line help.
+void DisplayHelp() {
+    if (!g_ConsoleAttached) {
+        if (AllocConsole()) {
+            g_ConsoleAttached = true;
+            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            DWORD dwMode = 0;
+            GetConsoleMode(hOut, &dwMode);
+            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            SetConsoleMode(hOut, dwMode);
+        }
+    }
+    
+    SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
+    SafeWriteConsole(L"ProcessController - 命令行参数帮助\n\n");
+    ResetConsoleColor();
+    SafeWriteConsole(L"用法: ProcessController.exe [参数] [值] ...\n\n");
+    
+    auto print_param = [](const std::wstring& param, const std::wstring& desc) {
+        SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
+        std::wstring paddedParam = param;
+        for (size_t i = param.length(); i < 15; ++i) paddedParam += L" ";
+        SafeWriteConsole(paddedParam);
+        ResetConsoleColor();
+        SafeWriteConsole(L"| " + desc + L"\n");
+    };
+
+    print_param(L"-ProcessName", L"目标进程的名称 (例如: chrome.exe)");
+    print_param(L"-ProcessId", L"目标进程的ID (例如: 1234)");
+    print_param(L"-Affinity", L"设置CPU亲和性 (例如: \"0 1 2\" 或 \"4-7\")");
+    print_param(L"-Priority", L"设置优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime)");
+    print_param(L"-Scheduling", L"设置调度优先级 (0-9)");
+    print_param(L"-Weight", L"设置时间片权重 (1-9), 与CpuLimit互斥");
+    print_param(L"-DSCP", L"设置网络数据包优先级 (0-63)");
+    print_param(L"-CpuLimit", L"设置CPU使用率上限 (1-100), 与Weight互斥");
+    print_param(L"-NetLimit", L"设置传出带宽上限 (单位: KB/s)");
+    print_param(L"-Working", L"设置物理内存限制 (格式: \"最小MB-最大MB\", 例如: \"10-100\")");
+    
+    SafeWriteConsole(L"\n示例:\n");
+    SafeWriteConsole(L"  ProcessController.exe -ProcessName \"game.exe\" -Affinity \"4-7\" -Priority High\n");
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
@@ -493,7 +544,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
-    // FIX: Enable Virtual Terminal Processing for RGB colors
     if (g_ConsoleAttached) {
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD dwMode = 0;
@@ -501,8 +551,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-
-    EnableAllPrivileges();
     
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -511,6 +559,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::map<std::wstring, std::wstring> args;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
+        if (arg == L"/?") {
+            args[L"?"] = L"";
+            continue;
+        }
         if (arg.rfind(L'-', 0) == 0 && i + 1 < argc) {
             arg.erase(0, 1);
             std::transform(arg.begin(), arg.end(), arg.begin(), ::towlower);
@@ -519,8 +571,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     LocalFree(argv);
 
+    if (args.count(L"?")) {
+        DisplayHelp();
+        return 0;
+    }
+
+    EnableAllPrivileges();
+
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        LogColor(0, L"错误: 无法设置 Ctrl+C 处理器。\n");
+        LogColor(L"错误: 无法设置 Ctrl+C 处理器。\n");
     }
 
     std::vector<DWORD> pids;
@@ -530,7 +589,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         } else if (args.count(L"processid")) {
             try { pids.push_back(std::stoi(args[L"processid"])); } catch(...) {}
         } else {
-            LogColor(0, L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
+            LogColor(L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
             return 1;
         }
     } else {
@@ -546,21 +605,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
-            if (pids.empty()) LogColor(0, L"未找到任何目标进程, 请重试。\n");
+            if (pids.empty()) LogColor(L"未找到任何目标进程, 请重试。\n");
         }
     }
 
     if (pids.empty()) {
-        LogColor(0, L"未找到任何目标进程, 脚本将退出。\n");
+        LogColor(L"未找到任何目标进程, 脚本将退出。\n");
         return 1;
     }
-    LogColor(0, L"已找到 %zu 个目标进程。\n", pids.size());
+    LogColor(L"已找到 %zu 个目标进程。\n", pids.size());
     
-    LogColor(0, L"为每个进程创建唯一的作业对象并分配...\n");
+    LogColor(L"为每个进程创建唯一的作业对象并分配...\n");
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (!hProcess) {
-            LogColor(0, L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError());
+            LogColor(L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError());
             continue;
         }
 
@@ -574,28 +633,28 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
         if (hJob) {
             if (AssignProcessToJobObject(hJob, hProcess)) {
-                LogColor(0, L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
+                LogColor(L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
                 g_hJobs.push_back(hJob);
             } else {
-                LogColor(0, L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
+                LogColor(L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
                 CloseHandle(hJob);
             }
         } else {
-            LogColor(0, L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
+            LogColor(L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
         }
         CloseHandle(hProcess);
     }
 
     if (g_hJobs.empty()) {
-        LogColor(0, L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
+        LogColor(L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
         return 1;
     }
 
     if (isOneShotMode) {
-        LogColor(0, L"----------------------------------------------------\n");
-        LogColor(0, L"正在应用一次性设置到 %zu 个作业对象...\n", g_hJobs.size());
+        LogColor(L"----------------------------------------------------\n");
+        LogColor(L"正在应用一次性设置到 %zu 个作业对象...\n", g_hJobs.size());
         DWORD_PTR affinity = 0;
-        int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
+        int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};
 
         if (args.count(L"affinity")) ParseAffinityString(args[L"affinity"], affinity);
@@ -608,6 +667,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (args.count(L"weight")) try { weight = std::stoi(args[L"weight"]); } catch(...) {}
         if (args.count(L"cpulimit")) try { cpuLimit = std::stoi(args[L"cpulimit"]); } catch(...) {}
         if (args.count(L"dscp")) try { dscp = std::stoi(args[L"dscp"]); } catch(...) {}
+        if (args.count(L"netlimit")) try { netLimit = std::stoi(args[L"netlimit"]); } catch(...) {}
         if (args.count(L"working")) {
             std::wstring ws_str = args[L"working"];
             size_t dash_pos = ws_str.find(L'-');
@@ -615,16 +675,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         
         int s, f;
-        JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet, s, f);
+        JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
         
-        LogColor(0, L"所有操作完成。脚本将退出，限制将持续有效。\n");
+        LogColor(L"所有操作完成。脚本将退出，限制将持续有效。\n");
         CleanupAndExit();
         if (g_ConsoleAttached) { FreeConsole(); }
         exit(0);
 
     } else {
         DWORD_PTR affinity = 0;
-        int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
+        int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};
 
         while (true) {
@@ -660,6 +720,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 SafeWriteConsole(L"新CPU使用率上限 (1-100) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
+            } else if (choice == L"7") {
+                SafeWriteConsole(L"新传出带宽上限 (KB/s) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") netLimit = -1; else try { netLimit = std::stoi(input); } catch(...) {}
             } else if (choice == L"8") {
                 SafeWriteConsole(L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
@@ -678,11 +742,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (settingChanged) {
                 int successCount, failCount;
                 if (choice == L"0") {
-                    // ClearAllJobSettings doesn't return status, so we assume success
                     successCount = g_hJobs.size();
                     failCount = 0;
                 } else {
-                    JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet, successCount, failCount);
+                    JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, successCount, failCount);
                 }
                 
                 SafeWriteConsole(L"应用结果 -> ");

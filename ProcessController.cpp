@@ -94,7 +94,8 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 }
 
 void EnableAllPrivileges() {
-    LogColor(COLOR_INFO, L"[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    // FIX: Add a newline character at the beginning of the string for correct CMD formatting.
+    LogColor(COLOR_INFO, L"\n[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
         L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
@@ -198,40 +199,56 @@ class JobController {
 public:
     JobController(HANDLE hJob) : m_hJob(hJob) {}
 
+    // FIX: This function no longer queries state. It creates clean structs and applies only the specified settings.
+    // This resolves the ERROR_INVALID_PARAMETER (87) issue.
     bool ApplySettings(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet) {
-        bool success = true;
-        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
-        QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo), NULL);
-        basicInfo.LimitFlags = 0;
-        if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; }
-        if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; }
-        if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; }
+        bool overallSuccess = true;
+
+        // --- Basic Limits ---
+        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {}; 
+        bool applyBasicLimits = false;
+
+        if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; applyBasicLimits = true; }
+        if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; applyBasicLimits = true; }
+        if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; applyBasicLimits = true; }
         if (workingSet.first > 0 && workingSet.second > 0) {
             basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_WORKINGSET;
             basicInfo.MinimumWorkingSetSize = workingSet.first * 1024 * 1024;
             basicInfo.MaximumWorkingSetSize = workingSet.second * 1024 * 1024;
+            applyBasicLimits = true;
         }
-        if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) success = false;
-
-        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
-        if (weight != -1) {
-            cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
-            cpuInfo.Weight = weight;
-        } else if (cpuLimit != -1) {
-            cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-            cpuInfo.CpuRate = cpuLimit * 100;
+        if (applyBasicLimits) {
+            if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
+                overallSuccess = false;
+            }
         }
-        if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) success = false;
 
-        JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-        netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
+        // --- CPU Limits ---
+        if (weight != -1 || cpuLimit != -1) {
+            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
+            if (weight != -1) {
+                cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+                cpuInfo.Weight = weight;
+            } else { // cpuLimit must be != -1
+                cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+                cpuInfo.CpuRate = cpuLimit * 100;
+            }
+            if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
+                overallSuccess = false;
+            }
+        }
+
+        // --- Network Limits ---
         if (dscp != -1) {
-            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(netInfo.ControlFlags | JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
+            JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
+            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
             netInfo.DscpTag = (BYTE)dscp;
+            if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
+                overallSuccess = false;
+            }
         }
-        if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) success = false;
         
-        return success;
+        return overallSuccess;
     }
 
     void DisplayStatus() {
@@ -290,15 +307,11 @@ private:
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
-    // --- FIX: Revised Console Handling for All Scenarios ---
     if (isOneShotMode) {
-        // In command-line mode, only attach if a parent console exists (like cmd.exe).
-        // If launched from explorer.exe, this will fail, and the app will run silently.
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
             g_ConsoleAttached = true;
         }
     } else {
-        // In interactive mode (double-clicked), we must have a console.
         if (AllocConsole()) {
             g_ConsoleAttached = true;
         }
@@ -321,10 +334,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     LocalFree(argv);
 
-    // CtrlHandler is primarily for interactive mode now.
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");
-        // Non-critical, so we don't exit.
     }
 
     std::vector<DWORD> pids;
@@ -345,7 +356,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
     } else {
-        // Interactive mode logic remains the same
         while (pids.empty()) {
             SafeWriteConsole(L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ");
             std::wstring name_input = SafeReadConsole();
@@ -387,22 +397,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
-    LogColor(COLOR_INFO, L"正在将进程分配到 Job Object...\n");
-    for (DWORD pid : pids) {
-        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
-        if (hProcess) {
-            if (AssignProcessToJobObject(g_hJob, hProcess)) {
-                LogColor(COLOR_SUCCESS, L"  -> 成功分配 PID: %lu\n", pid);
-            } else {
-                LogColor(COLOR_ERROR, L"  -> 失败分配 PID: %lu (错误码: %lu)\n", pid, GetLastError());
-            }
-            CloseHandle(hProcess);
-        } else {
-             LogColor(COLOR_ERROR, L"  -> 打开 PID %lu 失败！(错误码: %lu)\n", pid, GetLastError());
-        }
-    }
-    
     JobController controller(g_hJob);
+
+    // FIX: Apply settings BEFORE assigning processes for robustness.
     if (isOneShotMode) {
         LogColor(COLOR_INFO, L"----------------------------------------------------\n");
         LogColor(COLOR_INFO, L"正在应用一次性设置...\n");
@@ -436,22 +433,44 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
         }
         
-        if (controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
-            LogColor(COLOR_SUCCESS, L"设置已成功应用。脚本将退出，限制将持续有效。\n");
-        } else {
+        if (!controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
             LogColor(COLOR_ERROR, L"应用设置失败！错误码: %lu\n", GetLastError());
+            CloseHandle(g_hJob);
+            exit(1);
         }
-        
-        // --- FIX: Cleanly close the handle and exit the process ---
+    }
+
+    LogColor(COLOR_INFO, L"正在将进程分配到 Job Object...\n");
+    for (DWORD pid : pids) {
+        HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
+        if (hProcess) {
+            if (AssignProcessToJobObject(g_hJob, hProcess)) {
+                LogColor(COLOR_SUCCESS, L"  -> 成功分配 PID: %lu\n", pid);
+            } else {
+                DWORD lastError = GetLastError();
+                // FIX: Treat error 5 as a warning with a clear message.
+                if (lastError == 5) {
+                    LogColor(COLOR_WARNING, L"  -> 警告: 无法分配 PID %lu (错误码: 5 - 拒绝访问, 进程可能已属于另一个Job)\n", pid);
+                } else {
+                    LogColor(COLOR_ERROR, L"  -> 失败分配 PID: %lu (错误码: %lu)\n", pid, lastError);
+                }
+            }
+            CloseHandle(hProcess);
+        } else {
+             LogColor(COLOR_ERROR, L"  -> 打开 PID %lu 失败！(错误码: %lu)\n", pid, GetLastError());
+        }
+    }
+    
+    if (isOneShotMode) {
+        LogColor(COLOR_SUCCESS, L"所有操作完成。脚本将退出，限制将持续有效。\n");
         CloseHandle(g_hJob);
         g_hJob = NULL;
         if (g_ConsoleAttached) {
             FreeConsole();
         }
-        return 0; // Explicitly return to terminate the process and return control to caller.
-
+        // FIX: Use exit(0) for immediate and clean termination.
+        exit(0);
     } else {
-        // Interactive mode logic remains the same
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};

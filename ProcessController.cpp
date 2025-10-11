@@ -312,24 +312,41 @@ public:
         }
 
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-        // 1. 根据 netLimit 的值设置带宽限制标志和数据
+        // 1. 关键修复：首先从作业对象读取当前的网络限制状态
+        QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
+
+        // 2. 根据传入的 netLimit 参数，独立地修改带宽限制部分
         if (netLimit != -1) {
+            // 启用或更新带宽限制
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
             netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
+        } else {
+            // 仅禁用带宽限制，通过位运算移除其标志位
+            netInfo.ControlFlags &= ~JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
         }
 
-        // 2. 根据 dscp 的值设置DSCP标志和数据
+        // 3. 根据传入的 dscp 参数，独立地修改DSCP部分
         if (dscp != -1) {
+            // 启用或更新DSCP
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
             netInfo.DscpTag = (BYTE)dscp;
+        } else {
+            // 仅禁用DSCP，通过位运算移除其标志位
+            netInfo.ControlFlags &= ~JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
         }
 
-        // 3. 如果上面两个功能中至少有一个被启用，才添加总的启用标志
-        if (netInfo.ControlFlags != 0) {
+        // 4. 最后，检查是否还有任何网络限制处于激活状态
+        if ((netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) ||
+            (netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG))
+        {
+            // 如果至少有一个是激活的，确保总开关是开启的
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE;
+        } else {
+            // 如果两者都禁用了，则关闭总开关
+            netInfo.ControlFlags &= ~JOB_OBJECT_NET_RATE_CONTROL_ENABLE;
         }
 
-        // 4. 将最终构建好的设置应用到作业对象
+        // 5. 将最终计算出的、正确的状态应用回作业对象
         if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
             overallSuccess = false;
         }

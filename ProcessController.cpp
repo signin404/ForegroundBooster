@@ -39,15 +39,13 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
+bool g_ConsoleAttached = false;
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
 #define COLOR_WARNING 14
 #define COLOR_ERROR 12
 #define COLOR_DEFAULT 7
-
-// --- NEW: Global flag to control logging ---
-bool g_ConsoleAttached = false;
 
 void LogColor(int color, const wchar_t* format, ...) {
     if (!g_ConsoleAttached) return;
@@ -105,17 +103,17 @@ void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
+// --- FIX: Use wstringstream to avoid unsafe type conversion ---
 bool ParseAffinityString(std::wstring w_s, DWORD_PTR& mask) {
     std::replace(w_s.begin(), w_s.end(), L' ', L',');
-    std::string s(w_s.begin(), w_s.end());
     mask = 0;
-    std::stringstream ss(s);
-    std::string segment;
-    while (std::getline(ss, segment, ',')) {
+    std::wstringstream wss(w_s);
+    std::wstring segment;
+    while (std::getline(wss, segment, L',')) {
         if (segment.empty()) continue;
-        size_t dash_pos = segment.find('-');
+        size_t dash_pos = segment.find(L'-');
         try {
-            if (dash_pos == std::string::npos) {
+            if (dash_pos == std::wstring::npos) {
                 int cpu = std::stoi(segment);
                 if (cpu >= 0 && cpu < sizeof(DWORD_PTR) * 8) mask |= (1ULL << cpu);
             } else {
@@ -262,37 +260,30 @@ private:
     HANDLE m_hJob;
 };
 
-// --- NEW: Function to redirect standard I/O to the console ---
 void RedirectIOToConsole() {
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
     freopen_s(&f, "CONIN$", "r", stdin);
-
-    // Sync C++ streams with the new C streams
     std::wcout.clear();
     std::wcin.clear();
     std::wcerr.clear();
-
-    // Set streams to Unicode mode
     _setmode(_fileno(stdout), _O_U16TEXT);
     _setmode(_fileno(stdin),  _O_U16TEXT);
     _setmode(_fileno(stderr), _O_U16TEXT);
 }
 
-int wmain(int argc, wchar_t* argv[]) {
-    bool isOneShotMode = argc > 1;
+// --- FIX: Change entry point to wWinMain for /SUBSYSTEM:WINDOWS ---
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    bool isOneShotMode = wcslen(pCmdLine) > 0;
 
-    // --- MODIFIED: Conditional console attachment logic ---
     if (isOneShotMode) {
-        // Try to attach to parent console. If it fails, we run silently.
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
             g_ConsoleAttached = true;
             RedirectIOToConsole();
         }
     } else {
-        // Interactive mode MUST have a console.
-        if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+        if (AllocConsole()) {
             g_ConsoleAttached = true;
             RedirectIOToConsole();
         }
@@ -300,6 +291,11 @@ int wmain(int argc, wchar_t* argv[]) {
 
     EnableAllPrivileges();
     
+    // --- FIX: Manual command-line parsing for wWinMain ---
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 1;
+
     std::map<std::wstring, std::wstring> args;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -309,6 +305,8 @@ int wmain(int argc, wchar_t* argv[]) {
             args[arg] = argv[++i];
         }
     }
+    LocalFree(argv); // Free memory allocated by CommandLineToArgvW
+
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");
         return 1;
@@ -377,7 +375,6 @@ int wmain(int argc, wchar_t* argv[]) {
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (hProcess) {
-            // --- NEW: Enhanced per-process logging ---
             if (AssignProcessToJobObject(g_hJob, hProcess)) {
                 LogColor(COLOR_SUCCESS, L"  -> 成功分配 PID: %lu\n", pid);
             } else {

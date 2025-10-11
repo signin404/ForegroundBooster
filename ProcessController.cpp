@@ -13,13 +13,13 @@
 #include <io.h>
 #include <fcntl.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // --- NEW: For CommandLineToArgvW ---
+#include <shellapi.h>
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib") // --- NEW: For CommandLineToArgvW ---
+#pragma comment(lib, "shell32.lib")
 
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
@@ -41,7 +41,6 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
-// --- NEW: Flag for silent command-line operation ---
 bool g_isSilentMode = false;
 
 #define COLOR_INFO 11
@@ -51,7 +50,7 @@ bool g_isSilentMode = false;
 #define COLOR_DEFAULT 7
 
 void LogColor(int color, const wchar_t* format, ...) {
-    if (g_isSilentMode) return; // Do not log in silent mode
+    if (g_isSilentMode) return;
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
     wchar_t buffer[2048];
@@ -263,17 +262,24 @@ private:
     HANDLE m_hJob;
 };
 
-// --- FIX: Entry point changed to wWinMain for /SUBSYSTEM:WINDOWS ---
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;
 
     bool isOneShotMode = (argc > 1);
-    g_isSilentMode = isOneShotMode;
+    bool consoleAttached = false;
 
-    if (!isOneShotMode) {
+    // --- FIX: Smart console attachment logic ---
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        consoleAttached = true;
+    } else if (!isOneShotMode) {
+        // Only create a new console if running in interactive mode from a GUI
         AllocConsole();
+        consoleAttached = true;
+    }
+
+    if (consoleAttached) {
         FILE* f;
         freopen_s(&f, "CONOUT$", "w", stdout);
         freopen_s(&f, "CONIN$", "r", stdin);
@@ -282,6 +288,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         _setmode(_fileno(stdin),  _O_U16TEXT);
         _setmode(_fileno(stderr), _O_U16TEXT);
     }
+    
+    // If in one-shot mode but no console was attached, run silently.
+    g_isSilentMode = isOneShotMode && !consoleAttached;
 
     EnableAllPrivileges();
     
@@ -362,7 +371,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
-    // --- FIX: Enhanced logging for process assignment ---
     LogColor(COLOR_INFO, L"正在将目标进程分配到 Job Object...\n");
     int successCount = 0;
     for (DWORD pid : pids) {
@@ -495,6 +503,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         CleanupAndExit();
     }
 
-    LocalFree(argv); // Free memory allocated by CommandLineToArgvW
+    LocalFree(argv);
     return 0;
 }

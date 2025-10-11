@@ -13,13 +13,13 @@
 #include <io.h>
 #include <fcntl.h>
 #include <tlhelp32.h>
-#include <shellapi.h>
+#include <shellapi.h> // --- NEW: For CommandLineToArgvW ---
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shell32.lib") // --- NEW: For CommandLineToArgvW ---
 
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
@@ -41,7 +41,7 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
-bool g_isSilentMode = false;
+bool g_silentMode = false; // --- NEW: Global flag for silent mode ---
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
@@ -50,7 +50,7 @@ bool g_isSilentMode = false;
 #define COLOR_DEFAULT 7
 
 void LogColor(int color, const wchar_t* format, ...) {
-    if (g_isSilentMode) return;
+    if (g_silentMode) return; // --- MODIFIED: Respect silent mode ---
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
     wchar_t buffer[2048];
@@ -91,10 +91,11 @@ void EnableAllPrivileges() {
         if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, L"  -> 成功启用: %ws\n", priv);
         else LogColor(COLOR_WARNING, L"  -> 警告: 无法启用 %ws\n", priv);
     }
-    if (!g_isSilentMode) std::wcout << L"----------------------------------------------------\n" << std::endl;
+    if (!g_silentMode) std::wcout << L"----------------------------------------------------\n" << std::endl;
 }
 
 void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
+    if (g_silentMode) return;
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     std::wcout << label;
     for (size_t i = label.length(); i < 25; ++i) std::wcout << L" ";
@@ -130,7 +131,9 @@ bool ParseAffinityString(std::wstring w_s, DWORD_PTR& mask) {
 
 std::vector<DWORD> FindProcessByName(std::wstring processName) {
     std::vector<DWORD> pids;
-    if (processName.length() < 4 || _wcsicmp(processName.substr(processName.length() - 4).c_str(), L".exe") != 0) {
+    if (processName.length() > 4 && _wcsicmp(processName.substr(processName.length() - 4).c_str(), L".exe") == 0) {
+        // User provided .exe, do nothing
+    } else {
         processName += L".exe";
     }
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -160,7 +163,7 @@ void ClearAllJobSettings(HANDLE hJob) {
 
 void CleanupAndExit() {
     if (g_hJob != NULL && g_hJob != INVALID_HANDLE_VALUE) {
-        if (!g_isSilentMode) std::wcout << L"\n正在退出... 限制将保持生效。" << std::endl;
+        LogColor(COLOR_WARNING, L"\n正在退出... 限制将保持生效。\n");
         CloseHandle(g_hJob);
         g_hJob = NULL;
     }
@@ -218,6 +221,7 @@ public:
     }
 
     void DisplayStatus() {
+        if (g_silentMode) return;
         system("cls");
         std::wcout << L"--- 进程控制器菜单 ---\n";
         PrintStatusLine(L"-1. 禁用所有限制", L"");
@@ -262,24 +266,17 @@ private:
     HANDLE m_hJob;
 };
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
+// --- MODIFIED: Entry point changed to WinMain for windowless command-line operation ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     int argc;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;
 
     bool isOneShotMode = (argc > 1);
-    bool consoleAttached = false;
+    g_silentMode = isOneShotMode;
 
-    // --- FIX: Smart console attachment logic ---
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        consoleAttached = true;
-    } else if (!isOneShotMode) {
-        // Only create a new console if running in interactive mode from a GUI
+    if (!g_silentMode) {
         AllocConsole();
-        consoleAttached = true;
-    }
-
-    if (consoleAttached) {
         FILE* f;
         freopen_s(&f, "CONOUT$", "w", stdout);
         freopen_s(&f, "CONIN$", "r", stdin);
@@ -288,9 +285,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         _setmode(_fileno(stdin),  _O_U16TEXT);
         _setmode(_fileno(stderr), _O_U16TEXT);
     }
-    
-    // If in one-shot mode but no console was attached, run silently.
-    g_isSilentMode = isOneShotMode && !consoleAttached;
 
     EnableAllPrivileges();
     
@@ -303,11 +297,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             args[arg] = argv[++i];
         }
     }
+    
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        if (!g_isSilentMode) std::wcerr << L"错误: 无法设置 Ctrl+C 处理器。" << std::endl;
+        if (!g_silentMode) std::wcerr << L"错误: 无法设置 Ctrl+C 处理器。" << std::endl;
         LocalFree(argv);
         return 1;
     }
+
     std::vector<DWORD> pids;
     std::wstring jobIdentifier;
     bool isInputByName = false;
@@ -322,11 +318,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             jobIdentifier = args[L"processid"];
             try { pids.push_back(std::stoi(jobIdentifier)); } catch(...) {}
         } else {
-            if (!g_isSilentMode) std::wcerr << L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。" << std::endl;
+            MessageBoxW(NULL, L"在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。", L"参数错误", MB_OK | MB_ICONERROR);
             LocalFree(argv);
             return 1;
         }
-    } else {
+    } else { // Interactive mode
         while (pids.empty()) {
             std::wcout << L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ";
             std::wstring name_input;
@@ -348,8 +344,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             if (pids.empty()) std::wcerr << L"未找到任何目标进程, 请重试。" << std::endl;
         }
     }
+
     if (pids.empty()) {
-        if (!g_isSilentMode) std::wcerr << L"未找到任何目标进程, 脚本将退出。" << std::endl;
+        if (g_silentMode) MessageBoxW(NULL, L"未找到任何目标进程, 程序将退出。", L"错误", MB_OK | MB_ICONERROR);
+        else std::wcerr << L"未找到任何目标进程, 程序将退出。" << std::endl;
         LocalFree(argv);
         return 1;
     }
@@ -357,11 +355,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     for (DWORD pid : pids) LogColor(COLOR_INFO, L"  - PID: %lu\n", pid);
     
     std::wstring jobName;
-    if (isInputByName) {
-        jobName = L"Global\\ProcessControllerJob_Name_" + jobIdentifier;
-    } else {
-        jobName = L"Global\\ProcessControllerJob_PID_" + jobIdentifier;
-    }
+    if (isInputByName) jobName = L"Global\\ProcessControllerJob_Name_" + jobIdentifier;
+    else jobName = L"Global\\ProcessControllerJob_PID_" + jobIdentifier;
 
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
@@ -371,27 +366,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
-    LogColor(COLOR_INFO, L"正在将目标进程分配到 Job Object...\n");
-    int successCount = 0;
+    LogColor(COLOR_INFO, L"正在将进程分配到 Job Object...\n");
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (hProcess) {
+            // --- NEW: Enhanced logging for each process ---
             if (AssignProcessToJobObject(g_hJob, hProcess)) {
-                LogColor(COLOR_SUCCESS, L"  -> 成功分配 PID: %lu\n", pid);
-                successCount++;
+                LogColor(COLOR_SUCCESS, L"  -> 成功将 PID %lu 分配到作业对象\n", pid);
             } else {
-                LogColor(COLOR_ERROR, L"  -> 分配 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
+                LogColor(COLOR_ERROR, L"  -> 失败: 无法将 PID %lu 分配到作业对象 (错误码: %lu)\n", pid, GetLastError());
             }
             CloseHandle(hProcess);
         } else {
-             LogColor(COLOR_ERROR, L"  -> 打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
+             LogColor(COLOR_ERROR, L"  -> 失败: 无法打开 PID %lu (错误码: %lu)\n", pid, GetLastError());
         }
     }
-    LogColor(COLOR_INFO, L"分配完成: %d / %zu 个进程成功。\n", successCount, pids.size());
     
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        if (!g_isSilentMode) std::wcout << L"----------------------------------------------------\n" << L"正在应用一次性设置..." << std::endl;
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};
@@ -422,14 +414,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             }
         }
         
-        if (controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
-            if (!g_isSilentMode) std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
-        } else {
-            if (!g_isSilentMode) std::wcerr << L"应用设置失败！错误码: " << GetLastError() << std::endl;
-        }
+        controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet);
         CloseHandle(g_hJob);
         g_hJob = NULL;
-    } else {
+    } else { // Interactive mode
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};
@@ -502,7 +490,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         }
         CleanupAndExit();
     }
-
+    
     LocalFree(argv);
     return 0;
 }

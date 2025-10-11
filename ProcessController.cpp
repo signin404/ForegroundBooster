@@ -60,7 +60,8 @@ bool g_ConsoleAttached = false;
 void SafeWriteConsole(const std::wstring& text) {
     if (!g_ConsoleAttached) return;
     DWORD charsWritten;
-    WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), text.length(), &charsWritten, NULL);
+    // FIX C4267: Cast size_t to DWORD
+    WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), static_cast<DWORD>(text.length()), &charsWritten, NULL);
 }
 
 void SetConsoleColorRGB(int r, int g, int b) {
@@ -317,10 +318,10 @@ public:
             }
         }
 
-        // FIX: Re-integrated NetLimit logic, combined with DSCP
         if (dscp != -1 || netLimit != -1) {
             JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-            netInfo.ControlFlags = 0;
+            // FIX C2440: Explicitly cast integer 0 to the enum type.
+            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
             if (netLimit != -1) {
                 netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
                 netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
@@ -388,7 +389,7 @@ public:
             counts[MaskToAffinityString(info.Affinity)]++;
         }
         auto commonAffinity = findMostCommon(counts);
-        PrintStatusLine(L"1. 亲和性 (Affinity)", commonAffinity.first, counts[commonAffinity.first], g_hJobs.size() - counts[commonAffinity.first]);
+        PrintStatusLine(L"1. 亲和性 (Affinity)", commonAffinity.first, counts[commonAffinity.first], static_cast<int>(g_hJobs.size()) - counts[commonAffinity.first]);
 
         // 2. Priority
         counts.clear();
@@ -410,7 +411,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonPriority = findMostCommon(counts);
-        PrintStatusLine(L"2. 优先级 (Priority)", commonPriority.first, counts[commonPriority.first], g_hJobs.size() - counts[commonPriority.first]);
+        PrintStatusLine(L"2. 优先级 (Priority)", commonPriority.first, counts[commonPriority.first], static_cast<int>(g_hJobs.size()) - counts[commonPriority.first]);
 
         // 3. Scheduling
         counts.clear();
@@ -422,7 +423,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonScheduling = findMostCommon(counts);
-        PrintStatusLine(L"3. 调度优先级 (Scheduling)", commonScheduling.first, counts[commonScheduling.first], g_hJobs.size() - counts[commonScheduling.first]);
+        PrintStatusLine(L"3. 调度优先级 (Scheduling)", commonScheduling.first, counts[commonScheduling.first], static_cast<int>(g_hJobs.size()) - counts[commonScheduling.first]);
 
         // 4. Weight
         counts.clear();
@@ -434,7 +435,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonWeight = findMostCommon(counts);
-        PrintStatusLine(L"4. 时间片权重 (Weight)", commonWeight.first, counts[commonWeight.first], g_hJobs.size() - counts[commonWeight.first]);
+        PrintStatusLine(L"4. 时间片权重 (Weight)", commonWeight.first, counts[commonWeight.first], static_cast<int>(g_hJobs.size()) - counts[commonWeight.first]);
 
         // 5. DSCP
         counts.clear();
@@ -446,7 +447,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonDscp = findMostCommon(counts);
-        PrintStatusLine(L"5. 数据包优先级 (DSCP)", commonDscp.first, counts[commonDscp.first], g_hJobs.size() - counts[commonDscp.first]);
+        PrintStatusLine(L"5. 数据包优先级 (DSCP)", commonDscp.first, counts[commonDscp.first], static_cast<int>(g_hJobs.size()) - counts[commonDscp.first]);
 
         // 6. CpuLimit
         counts.clear();
@@ -458,7 +459,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonCpuLimit = findMostCommon(counts);
-        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", commonCpuLimit.first, counts[commonCpuLimit.first], g_hJobs.size() - counts[commonCpuLimit.first]);
+        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", commonCpuLimit.first, counts[commonCpuLimit.first], static_cast<int>(g_hJobs.size()) - counts[commonCpuLimit.first]);
 
         // 7. NetLimit
         counts.clear();
@@ -470,7 +471,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonNetLimit = findMostCommon(counts);
-        PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", commonNetLimit.first, counts[commonNetLimit.first], g_hJobs.size() - counts[commonNetLimit.first]);
+        PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", commonNetLimit.first, counts[commonNetLimit.first], static_cast<int>(g_hJobs.size()) - counts[commonNetLimit.first]);
 
         // 8. WorkingSet
         counts.clear();
@@ -482,13 +483,12 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonWorkingSet = findMostCommon(counts);
-        PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", commonWorkingSet.first, counts[commonWorkingSet.first], g_hJobs.size() - counts[commonWorkingSet.first]);
+        PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", commonWorkingSet.first, counts[commonWorkingSet.first], static_cast<int>(g_hJobs.size()) - counts[commonWorkingSet.first]);
         
         SafeWriteConsole(L"----------------------------------------------------\n");
     }
 };
 
-// FIX: New function to display command-line help.
 void DisplayHelp() {
     if (!g_ConsoleAttached) {
         if (AllocConsole()) {

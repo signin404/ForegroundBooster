@@ -13,11 +13,13 @@
 #include <io.h>
 #include <fcntl.h>
 #include <tlhelp32.h>
+#include <shellapi.h> // --- NEW: For CommandLineToArgvW ---
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib") // --- NEW: For CommandLineToArgvW ---
 
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
@@ -39,6 +41,8 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
+// --- NEW: Flag for silent command-line operation ---
+bool g_isSilentMode = false;
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
@@ -47,6 +51,7 @@ HANDLE g_hJob = NULL;
 #define COLOR_DEFAULT 7
 
 void LogColor(int color, const wchar_t* format, ...) {
+    if (g_isSilentMode) return; // Do not log in silent mode
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
     wchar_t buffer[2048];
@@ -87,7 +92,7 @@ void EnableAllPrivileges() {
         if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, L"  -> 成功启用: %ws\n", priv);
         else LogColor(COLOR_WARNING, L"  -> 警告: 无法启用 %ws\n", priv);
     }
-    std::wcout << L"----------------------------------------------------\n" << std::endl;
+    if (!g_isSilentMode) std::wcout << L"----------------------------------------------------\n" << std::endl;
 }
 
 void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
@@ -156,7 +161,7 @@ void ClearAllJobSettings(HANDLE hJob) {
 
 void CleanupAndExit() {
     if (g_hJob != NULL && g_hJob != INVALID_HANDLE_VALUE) {
-        std::wcout << L"\n正在退出... 限制将保持生效。" << std::endl;
+        if (!g_isSilentMode) std::wcout << L"\n正在退出... 限制将保持生效。" << std::endl;
         CloseHandle(g_hJob);
         g_hJob = NULL;
     }
@@ -177,53 +182,40 @@ class JobController {
 public:
     JobController(HANDLE hJob) : m_hJob(hJob) {}
 
-    // --- FIX: Rewritten to be intelligent and avoid unnecessary API calls ---
     bool ApplySettings(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet) {
-        bool overallSuccess = true;
-
-        // --- Group 1: Basic Limits ---
-        bool needsBasicUpdate = (affinity != -1) || (priority != -1) || (scheduling != -1) || (workingSet.first != -1);
-        if (needsBasicUpdate) {
-            JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
-            basicInfo.LimitFlags = 0;
-            if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; }
-            if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; }
-            if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; }
-            if (workingSet.first > 0 && workingSet.second > 0) {
-                basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_WORKINGSET;
-                basicInfo.MinimumWorkingSetSize = workingSet.first * 1024 * 1024;
-                basicInfo.MaximumWorkingSetSize = workingSet.second * 1024 * 1024;
-            }
-            if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) overallSuccess = false;
+        bool success = true;
+        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
+        QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo), NULL);
+        basicInfo.LimitFlags = 0;
+        if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; }
+        if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; }
+        if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; }
+        if (workingSet.first > 0 && workingSet.second > 0) {
+            basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_WORKINGSET;
+            basicInfo.MinimumWorkingSetSize = workingSet.first * 1024 * 1024;
+            basicInfo.MaximumWorkingSetSize = workingSet.second * 1024 * 1024;
         }
+        if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) success = false;
 
-        // --- Group 2: CPU Limits ---
-        bool needsCpuUpdate = (weight != -1) || (cpuLimit != -1);
-        if (needsCpuUpdate) {
-            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
-            if (weight > 0) {
-                cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
-                cpuInfo.Weight = weight;
-            } else if (cpuLimit > 0) {
-                cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-                cpuInfo.CpuRate = cpuLimit * 100;
-            }
-            if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) overallSuccess = false;
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
+        if (weight != -1) {
+            cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+            cpuInfo.Weight = weight;
+        } else if (cpuLimit != -1) {
+            cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpuInfo.CpuRate = cpuLimit * 100;
         }
+        if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) success = false;
 
-        // --- Group 3: Network Limits ---
-        bool needsNetUpdate = (dscp != -1);
-        if (needsNetUpdate) {
-            JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
-            if (dscp >= 0) {
-                netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(netInfo.ControlFlags | JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
-                netInfo.DscpTag = (BYTE)dscp;
-            }
-            if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) overallSuccess = false;
+        JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
+        netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
+        if (dscp != -1) {
+            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(netInfo.ControlFlags | JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
+            netInfo.DscpTag = (BYTE)dscp;
         }
+        if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) success = false;
         
-        return overallSuccess;
+        return success;
     }
 
     void DisplayStatus() {
@@ -271,26 +263,40 @@ private:
     HANDLE m_hJob;
 };
 
-int wmain(int argc, wchar_t* argv[]) {
-    _setmode(_fileno(stdout), _O_U16TEXT);
-    _setmode(_fileno(stdin),  _O_U16TEXT);
-    _setmode(_fileno(stderr), _O_U16TEXT);
+// --- FIX: Entry point changed to wWinMain for /SUBSYSTEM:WINDOWS ---
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
+    int argc;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 1;
+
+    bool isOneShotMode = (argc > 1);
+    g_isSilentMode = isOneShotMode;
+
+    if (!isOneShotMode) {
+        AllocConsole();
+        FILE* f;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONIN$", "r", stdin);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        _setmode(_fileno(stdout), _O_U16TEXT);
+        _setmode(_fileno(stdin),  _O_U16TEXT);
+        _setmode(_fileno(stderr), _O_U16TEXT);
+    }
 
     EnableAllPrivileges();
     
     std::map<std::wstring, std::wstring> args;
-    bool isOneShotMode = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
         if (arg.rfind(L'-', 0) == 0 && i + 1 < argc) {
-            isOneShotMode = true;
             arg.erase(0, 1);
             std::transform(arg.begin(), arg.end(), arg.begin(), ::towlower);
             args[arg] = argv[++i];
         }
     }
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        std::wcerr << L"错误: 无法设置 Ctrl+C 处理器。" << std::endl;
+        if (!g_isSilentMode) std::wcerr << L"错误: 无法设置 Ctrl+C 处理器。" << std::endl;
+        LocalFree(argv);
         return 1;
     }
     std::vector<DWORD> pids;
@@ -307,7 +313,8 @@ int wmain(int argc, wchar_t* argv[]) {
             jobIdentifier = args[L"processid"];
             try { pids.push_back(std::stoi(jobIdentifier)); } catch(...) {}
         } else {
-            std::wcerr << L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。" << std::endl;
+            if (!g_isSilentMode) std::wcerr << L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。" << std::endl;
+            LocalFree(argv);
             return 1;
         }
     } else {
@@ -333,11 +340,12 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
     if (pids.empty()) {
-        std::wcerr << L"未找到任何目标进程, 脚本将退出。" << std::endl;
+        if (!g_isSilentMode) std::wcerr << L"未找到任何目标进程, 脚本将退出。" << std::endl;
+        LocalFree(argv);
         return 1;
     }
-    std::wcout << L"已找到 " << pids.size() << L" 个目标进程:" << std::endl;
-    for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
+    LogColor(COLOR_INFO, L"已找到 %zu 个目标进程:\n", pids.size());
+    for (DWORD pid : pids) LogColor(COLOR_INFO, L"  - PID: %lu\n", pid);
     
     std::wstring jobName;
     if (isInputByName) {
@@ -349,28 +357,36 @@ int wmain(int argc, wchar_t* argv[]) {
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
         LogColor(COLOR_ERROR, L"CreateJobObjectW 失败！错误码: %lu\n", GetLastError());
+        LocalFree(argv);
         return 1;
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
+    // --- FIX: Enhanced logging for process assignment ---
+    LogColor(COLOR_INFO, L"正在将目标进程分配到 Job Object...\n");
+    int successCount = 0;
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (hProcess) {
-            if (!AssignProcessToJobObject(g_hJob, hProcess)) LogColor(COLOR_ERROR, L"将 PID %lu 分配到 Job Object 失败！错误码: %lu\n", pid, GetLastError());
+            if (AssignProcessToJobObject(g_hJob, hProcess)) {
+                LogColor(COLOR_SUCCESS, L"  -> 成功分配 PID: %lu\n", pid);
+                successCount++;
+            } else {
+                LogColor(COLOR_ERROR, L"  -> 分配 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
+            }
             CloseHandle(hProcess);
         } else {
-             LogColor(COLOR_ERROR, L"打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
+             LogColor(COLOR_ERROR, L"  -> 打开 PID %lu 失败！错误码: %lu\n", pid, GetLastError());
         }
     }
-    std::wcout << L"已将所有目标进程分配到 Job Object。" << std::endl;
+    LogColor(COLOR_INFO, L"分配完成: %d / %zu 个进程成功。\n", successCount, pids.size());
     
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        std::wcout << L"----------------------------------------------------\n";
-        std::wcout << L"正在应用一次性设置..." << std::endl;
-        DWORD_PTR affinity = -1; // Use -1 to indicate "not set"
+        if (!g_isSilentMode) std::wcout << L"----------------------------------------------------\n" << L"正在应用一次性设置..." << std::endl;
+        DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
-        std::pair<size_t, size_t> workingSet = {-1, -1};
+        std::pair<size_t, size_t> workingSet = {0, 0};
 
         if (args.count(L"affinity")) ParseAffinityString(args[L"affinity"], affinity);
         if (args.count(L"priority")) {
@@ -398,8 +414,11 @@ int wmain(int argc, wchar_t* argv[]) {
             }
         }
         
-        if (controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
-        else std::wcerr << L"应用一个或多个设置失败！错误码: " << GetLastError() << std::endl;
+        if (controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
+            if (!g_isSilentMode) std::wcout << L"设置已成功应用。脚本将退出，限制将持续有效。" << std::endl;
+        } else {
+            if (!g_isSilentMode) std::wcerr << L"应用设置失败！错误码: " << GetLastError() << std::endl;
+        }
         CloseHandle(g_hJob);
         g_hJob = NULL;
     } else {
@@ -423,7 +442,6 @@ int wmain(int argc, wchar_t* argv[]) {
                 std::wcout << L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") affinity = 0; else ParseAffinityString(input, affinity);
-                controller.ApplySettings(affinity, -1, -1, -1, -1, -1, {-1,-1});
             } else if (choice == L"2") {
                 std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
                 std::wstring w_input; std::getline(std::wcin, w_input);
@@ -435,27 +453,22 @@ int wmain(int argc, wchar_t* argv[]) {
                 else if (w_input == L"abovenormal") priority = ABOVE_NORMAL_PRIORITY_CLASS;
                 else if (w_input == L"high") priority = HIGH_PRIORITY_CLASS;
                 else if (w_input == L"realtime") priority = REALTIME_PRIORITY_CLASS;
-                controller.ApplySettings(-1, priority, -1, -1, -1, -1, {-1,-1});
             } else if (choice == L"3") {
                 std::wcout << L"新调度优先级 (0-9) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") scheduling = -1; else try { scheduling = std::stoi(input); } catch(...) {}
-                controller.ApplySettings(-1, -1, scheduling, -1, -1, -1, {-1,-1});
             } else if (choice == L"4") {
                 std::wcout << L"新时间片权重 (1-9) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") weight = -1; else try { weight = std::stoi(input); cpuLimit = -1; } catch(...) {}
-                controller.ApplySettings(-1, -1, -1, weight, -1, cpuLimit, {-1,-1});
             } else if (choice == L"5") {
                 std::wcout << L"新数据包优先级 (0-63) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") dscp = -1; else try { dscp = std::stoi(input); } catch(...) {}
-                controller.ApplySettings(-1, -1, -1, -1, dscp, -1, {-1,-1});
             } else if (choice == L"6") {
                 std::wcout << L"新CPU使用率上限 (1-100) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
                 if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
-                controller.ApplySettings(-1, -1, -1, weight, -1, cpuLimit, {-1,-1});
             } else if (choice == L"8") {
                 std::wcout << L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
@@ -466,19 +479,22 @@ int wmain(int argc, wchar_t* argv[]) {
                         try {
                             workingSet.first = std::stoul(input.substr(0, dash_pos));
                             workingSet.second = std::stoul(input.substr(dash_pos + 1));
-                        } catch(...) { workingSet = {-1,-1}; }
+                        } catch(...) {}
                     }
                 }
-                controller.ApplySettings(-1, -1, -1, -1, -1, -1, workingSet);
             } else if (choice == L"exit") {
                 break;
             } else {
                 std::wcout << L"无效的选择, 请按回车键重试...";
                 std::wstring dummy;
                 std::getline(std::wcin, dummy);
+                continue;
             }
+            controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet);
         }
         CleanupAndExit();
     }
+
+    LocalFree(argv); // Free memory allocated by CommandLineToArgvW
     return 0;
 }

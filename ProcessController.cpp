@@ -41,10 +41,6 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 std::vector<HANDLE> g_hJobs;
 bool g_ConsoleAttached = false;
 
-// --- FIX: New global flags for Ctrl+C handling ---
-volatile bool g_reset_session = false;
-bool g_is_interactive_mode = false;
-
 #define COLOR_LABEL_R 38
 #define COLOR_LABEL_G 160
 #define COLOR_LABEL_B 218
@@ -93,7 +89,6 @@ std::wstring SafeReadConsole() {
     if (!g_ConsoleAttached) return L"";
     wchar_t buffer[512];
     DWORD charsRead;
-    // This will be interrupted by Ctrl+C, which is the desired behavior.
     ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 512, &charsRead, NULL);
     if (charsRead >= 2 && buffer[charsRead - 2] == L'\r' && buffer[charsRead - 1] == L'\n') {
         return std::wstring(buffer, charsRead - 2);
@@ -249,9 +244,11 @@ void ClearAllJobSettings() {
     }
 }
 
-// FIX: Renamed to reflect its new purpose.
-void CloseCurrentSessionHandles() {
+void CleanupAndExit() {
     if (!g_hJobs.empty()) {
+        SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
+        SafeWriteConsole(L"\n正在退出... 限制将保持生效。\n");
+        ResetConsoleColor();
         for (HANDLE hJob : g_hJobs) {
             CloseHandle(hJob);
         }
@@ -259,21 +256,10 @@ void CloseCurrentSessionHandles() {
     }
 }
 
-// FIX: Modified Ctrl+C handler for interactive mode.
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
     switch (fdwCtrlType) {
-    case CTRL_C_EVENT:
-        if (g_is_interactive_mode) {
-            g_reset_session = true;
-            SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
-            SafeWriteConsole(L"\n操作已取消, 返回进程选择菜单...\n");
-            ResetConsoleColor();
-            return TRUE; // Signal handled, prevent termination.
-        }
-        // Fallthrough for non-interactive mode
-    case CTRL_BREAK_EVENT:
-    case CTRL_CLOSE_EVENT:
-        CloseCurrentSessionHandles();
+    case CTRL_C_EVENT: case CTRL_BREAK_EVENT: case CTRL_CLOSE_EVENT:
+        CleanupAndExit();
         exit(0);
         return TRUE;
     default:
@@ -540,7 +526,6 @@ void DisplayHelp() {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
-    g_is_interactive_mode = !isOneShotMode;
 
     g_ConsoleAttached = false;
     if (isOneShotMode) {
@@ -591,8 +576,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         LogColor(L"错误: 无法设置 Ctrl+C 处理器。\n");
     }
 
+    std::vector<DWORD> pids;
     if (isOneShotMode) {
-        std::vector<DWORD> pids;
         if (args.count(L"processname")) {
             pids = FindProcessByName(args[L"processname"]);
         } else if (args.count(L"processid")) {
@@ -601,45 +586,65 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             LogColor(L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
             return 1;
         }
-
-        if (pids.empty()) {
-            LogColor(L"未找到任何目标进程, 脚本将退出。\n");
-            return 1;
-        }
-        LogColor(L"已找到 %zu 个目标进程。\n", pids.size());
-        
-        LogColor(L"为每个进程创建唯一的作业对象并分配...\n");
-        for (DWORD pid : pids) {
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
-            if (!hProcess) {
-                LogColor(L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError());
-                continue;
-            }
-            wchar_t processName[MAX_PATH];
-            if (GetModuleBaseNameW(hProcess, NULL, processName, MAX_PATH) == 0) {
-                wcscpy_s(processName, L"UnknownProcess");
-            }
-            std::wstring jobName = L"Global\\ProcessControllerJob_" + std::wstring(processName) + L"_" + std::to_wstring(pid);
-            HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
-            if (hJob) {
-                if (AssignProcessToJobObject(hJob, hProcess)) {
-                    LogColor(L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
-                    g_hJobs.push_back(hJob);
-                } else {
-                    LogColor(L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
-                    CloseHandle(hJob);
-                }
+    } else {
+        while (pids.empty()) {
+            SafeWriteConsole(L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ");
+            std::wstring name_input = SafeReadConsole();
+            if (!name_input.empty()) {
+                pids = FindProcessByName(name_input);
             } else {
-                LogColor(L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
+                SafeWriteConsole(L"请输入目标进程ID: ");
+                std::wstring id_input = SafeReadConsole();
+                try {
+                    if(!id_input.empty()) pids.push_back(std::stoi(id_input));
+                } catch(...) {}
             }
-            CloseHandle(hProcess);
+            if (pids.empty()) LogColor(L"未找到任何目标进程, 请重试。\n");
+        }
+    }
+
+    if (pids.empty()) {
+        LogColor(L"未找到任何目标进程, 脚本将退出。\n");
+        return 1;
+    }
+    LogColor(L"已找到 %zu 个目标进程。\n", pids.size());
+    
+    LogColor(L"为每个进程创建唯一的作业对象并分配...\n");
+    for (DWORD pid : pids) {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
+        if (!hProcess) {
+            LogColor(L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError());
+            continue;
         }
 
-        if (g_hJobs.empty()) {
-            LogColor(L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
-            return 1;
+        wchar_t processName[MAX_PATH];
+        if (GetModuleBaseNameW(hProcess, NULL, processName, MAX_PATH) == 0) {
+            wcscpy_s(processName, L"UnknownProcess");
         }
 
+        std::wstring jobName = L"Global\\ProcessControllerJob_" + std::wstring(processName) + L"_" + std::to_wstring(pid);
+        
+        HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
+        if (hJob) {
+            if (AssignProcessToJobObject(hJob, hProcess)) {
+                LogColor(L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
+                g_hJobs.push_back(hJob);
+            } else {
+                LogColor(L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
+                CloseHandle(hJob);
+            }
+        } else {
+            LogColor(L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
+        }
+        CloseHandle(hProcess);
+    }
+
+    if (g_hJobs.empty()) {
+        LogColor(L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
+        return 1;
+    }
+
+    if (isOneShotMode) {
         LogColor(L"----------------------------------------------------\n");
         LogColor(L"正在应用一次性设置到 %zu 个作业对象...\n", g_hJobs.size());
         DWORD_PTR affinity = 0;
@@ -667,136 +672,82 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
         
         LogColor(L"所有操作完成。脚本将退出，限制将持续有效。\n");
-        CloseCurrentSessionHandles();
+        CleanupAndExit();
         if (g_ConsoleAttached) { FreeConsole(); }
         exit(0);
+
     } else {
-        // --- FIX: Main application loop for interactive mode ---
+        DWORD_PTR affinity = 0;
+        int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
+        std::pair<size_t, size_t> workingSet = {0, 0};
+
         while (true) {
-            g_reset_session = false;
-            std::vector<DWORD> pids;
-            while (pids.empty() && !g_reset_session) {
-                SafeWriteConsole(L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID (按Ctrl+C退出程序): ");
-                std::wstring name_input = SafeReadConsole();
-                if (g_reset_session) { // Ctrl+C during process selection should exit the app
-                    CloseCurrentSessionHandles();
-                    return 0;
+            JobController::DisplayAggregatedStatus();
+            SafeWriteConsole(L"请选择要修改的功能 (0-8), 或输入 'exit' 退出: ");
+            std::wstring choice = SafeReadConsole();
+            bool settingChanged = true;
+            
+            if (choice == L"0") {
+                ClearAllJobSettings();
+                affinity = 0;
+                priority = -1;
+                scheduling = -1;
+                weight = -1;
+                dscp = -1;
+                cpuLimit = -1;
+                netLimit = -1;
+                workingSet = {0, 0};
+            } else if (choice == L"1") {
+                SafeWriteConsole(L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") affinity = 0; else ParseAffinityString(input, affinity);
+            } else if (choice == L"2") {
+                SafeWriteConsole(L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
+                std::wstring w_input = SafeReadConsole();
+                std::transform(w_input.begin(), w_input.end(), w_input.begin(), ::towlower);
+                if (w_input == L"-1") priority = -1; else if (w_input == L"idle") priority = IDLE_PRIORITY_CLASS; else if (w_input == L"belownormal") priority = BELOW_NORMAL_PRIORITY_CLASS; else if (w_input == L"normal") priority = NORMAL_PRIORITY_CLASS; else if (w_input == L"abovenormal") priority = ABOVE_NORMAL_PRIORITY_CLASS; else if (w_input == L"high") priority = HIGH_PRIORITY_CLASS; else if (w_input == L"realtime") priority = REALTIME_PRIORITY_CLASS;
+            } else if (choice == L"3") {
+                SafeWriteConsole(L"新调度优先级 (0-9) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") scheduling = -1; else try { scheduling = std::stoi(input); } catch(...) {}
+            } else if (choice == L"4") {
+                SafeWriteConsole(L"新时间片权重 (1-9) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") weight = -1; else try { weight = std::stoi(input); cpuLimit = -1; } catch(...) {}
+            } else if (choice == L"5") {
+                SafeWriteConsole(L"新数据包优先级 (0-63) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") dscp = -1; else try { dscp = std::stoi(input); } catch(...) {}
+            } else if (choice == L"6") {
+                SafeWriteConsole(L"新CPU使用率上限 (1-100) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
+            } else if (choice == L"7") {
+                SafeWriteConsole(L"新传出带宽上限 (KB/s) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") netLimit = -1; else try { netLimit = std::stoi(input); } catch(...) {}
+            } else if (choice == L"8") {
+                SafeWriteConsole(L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
+                if (input == L"-1") { workingSet = {0, 0}; }
+                else {
+                    size_t dash_pos = input.find(L'-');
+                    if (dash_pos != std::wstring::npos) { try { workingSet.first = std::stoul(ws_str.substr(0, dash_pos)); workingSet.second = std::stoul(ws_str.substr(dash_pos + 1)); } catch(...) {} }
                 }
-                if (!name_input.empty()) {
-                    pids = FindProcessByName(name_input);
-                } else {
-                    SafeWriteConsole(L"请输入目标进程ID: ");
-                    std::wstring id_input = SafeReadConsole();
-                    if (g_reset_session) {
-                        CloseCurrentSessionHandles();
-                        return 0;
-                    }
-                    try {
-                        if(!id_input.empty()) pids.push_back(std::stoi(id_input));
-                    } catch(...) {}
-                }
-                if (pids.empty()) LogColor(L"未找到任何目标进程, 请重试。\n");
+            } else if (choice == L"exit") {
+                break;
+            } else {
+                SafeWriteConsole(L"无效的选择, 请按回车键重试...");
+                SafeReadConsole();
+                settingChanged = false;
             }
-
-            if (g_reset_session) continue;
-
-            LogColor(L"已找到 %zu 个目标进程。\n", pids.size());
-            LogColor(L"为每个进程创建唯一的作业对象并分配...\n");
-            for (DWORD pid : pids) {
-                HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
-                if (!hProcess) { LogColor(L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError()); continue; }
-                wchar_t processName[MAX_PATH];
-                if (GetModuleBaseNameW(hProcess, NULL, processName, MAX_PATH) == 0) { wcscpy_s(processName, L"UnknownProcess"); }
-                std::wstring jobName = L"Global\\ProcessControllerJob_" + std::wstring(processName) + L"_" + std::to_wstring(pid);
-                HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
-                if (hJob) {
-                    if (AssignProcessToJobObject(hJob, hProcess)) {
-                        LogColor(L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
-                        g_hJobs.push_back(hJob);
-                    } else {
-                        LogColor(L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
-                        CloseHandle(hJob);
-                    }
-                } else {
-                    LogColor(L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
-                }
-                CloseHandle(hProcess);
-            }
-
-            if (g_hJobs.empty()) {
-                LogColor(L"未能成功创建并分配任何作业对象, 请重试。\n");
-                continue;
-            }
-
-            DWORD_PTR affinity = 0;
-            int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1, netLimit = -1;
-            std::pair<size_t, size_t> workingSet = {0, 0};
-            bool exit_app = false;
-
-            while (!g_reset_session) {
-                JobController::DisplayAggregatedStatus();
-                SafeWriteConsole(L"请选择要修改的功能 (0-8), 'exit' 退出, 或按 Ctrl+C 返回进程选择: ");
-                std::wstring choice = SafeReadConsole();
-                if (g_reset_session) continue;
-
-                if (choice == L"0") {
-                    ClearAllJobSettings();
-                    affinity = 0; priority = -1; scheduling = -1; weight = -1; dscp = -1; cpuLimit = -1; netLimit = -1; workingSet = {0, 0};
-                } else if (choice == L"1") {
-                    SafeWriteConsole(L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") affinity = 0; else ParseAffinityString(input, affinity);
-                } else if (choice == L"2") {
-                    SafeWriteConsole(L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
-                    std::wstring w_input = SafeReadConsole(); if (g_reset_session) continue;
-                    std::transform(w_input.begin(), w_input.end(), w_input.begin(), ::towlower);
-                    if (w_input == L"-1") priority = -1; else if (w_input == L"idle") priority = IDLE_PRIORITY_CLASS; else if (w_input == L"belownormal") priority = BELOW_NORMAL_PRIORITY_CLASS; else if (w_input == L"normal") priority = NORMAL_PRIORITY_CLASS; else if (w_input == L"abovenormal") priority = ABOVE_NORMAL_PRIORITY_CLASS; else if (w_input == L"high") priority = HIGH_PRIORITY_CLASS; else if (w_input == L"realtime") priority = REALTIME_PRIORITY_CLASS;
-                } else if (choice == L"3") {
-                    SafeWriteConsole(L"新调度优先级 (0-9) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") scheduling = -1; else try { scheduling = std::stoi(input); } catch(...) {}
-                } else if (choice == L"4") {
-                    SafeWriteConsole(L"新时间片权重 (1-9) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") weight = -1; else try { weight = std::stoi(input); cpuLimit = -1; } catch(...) {}
-                } else if (choice == L"5") {
-                    SafeWriteConsole(L"新数据包优先级 (0-63) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") dscp = -1; else try { dscp = std::stoi(input); } catch(...) {}
-                } else if (choice == L"6") {
-                    SafeWriteConsole(L"新CPU使用率上限 (1-100) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
-                } else if (choice == L"7") {
-                    SafeWriteConsole(L"新传出带宽上限 (KB/s) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") netLimit = -1; else try { netLimit = std::stoi(input); } catch(...) {}
-                } else if (choice == L"8") {
-                    SafeWriteConsole(L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ");
-                    std::wstring input = SafeReadConsole(); if (g_reset_session) continue;
-                    if (input == L"-1") { workingSet = {0, 0}; }
-                    else {
-                        size_t dash_pos = input.find(L'-');
-                        if (dash_pos != std::wstring::npos) { try { workingSet.first = std::stoul(input.substr(0, dash_pos)); workingSet.second = std::stoul(input.substr(dash_pos + 1)); } catch(...) {} }
-                    }
-                } else if (choice == L"exit") {
-                    exit_app = true;
-                    break;
-                } else {
-                    SafeWriteConsole(L"无效的选择, 请按回车键重试...");
-                    SafeReadConsole();
-                    continue;
-                }
-                
-                int s, f;
+            
+            if (settingChanged) {
+                int s, f; // Dummy variables, not used.
                 JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
             }
-
-            CloseCurrentSessionHandles();
-            if (exit_app) {
-                break;
-            }
         }
+        CleanupAndExit();
     }
 
     if (g_ConsoleAttached) {

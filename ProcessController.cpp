@@ -312,21 +312,34 @@ public:
         }
 
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-        netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
+        // 1. 先查询现有的网络限制设置
+        QueryInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo), NULL);
+
+        // 2. 根据传入的 netLimit 值修改或禁用带宽限制
         if (netLimit != -1) {
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
             netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
+        } else {
+            netInfo.ControlFlags &= ~JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH; // 使用位运算移除带宽限制标志
         }
+
+        // 3. 根据传入的 dscp 值修改或禁用DSCP标记
         if (dscp != -1) {
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
             netInfo.DscpTag = (BYTE)dscp;
+        } else {
+            netInfo.ControlFlags &= ~JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG; // 使用位运算移除DSCP标志
         }
+
+        // 4. 如果带宽和DSCP都禁用了，则禁用整个网络速率控制功能
+        if (!(netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH) && !(netInfo.ControlFlags & JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG)) {
+            netInfo.ControlFlags &= ~JOB_OBJECT_NET_RATE_CONTROL_ENABLE;
+        }
+
+        // 5. 将修改后的设置应用回去
         if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
             overallSuccess = false;
         }
-        
-        return overallSuccess;
-    }
 
     static void DisplayAggregatedStatus() {
         if (g_hJobs.empty()) return;

@@ -18,8 +18,8 @@ jobs:
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
         
-        rem --- FIX: 添加 /utf-8 标志，确保编译器正确处理源文件中的中文字符 ---
-        cl.exe /EHsc /O2 /W3 /utf-8 /Fe:ProcessController.exe ProcessController.cpp /link /SUBSYSTEM:CONSOLE
+        rem --- FIX: Changed subsystem to WINDOWS for headless command-line operation ---
+        cl.exe /EHsc /O2 /W3 /utf-8 /Fe:ProcessController.exe ProcessController.cpp /link /SUBSYSTEM:WINDOWS
         
         mt.exe -manifest ProcessController.exe.manifest -outputresource:ProcessController.exe;1
       shell: cmd

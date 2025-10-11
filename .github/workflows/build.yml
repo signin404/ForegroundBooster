@@ -17,10 +17,7 @@ jobs:
     - name: Compile and Embed Manifest
       run: |
         call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-        
-        rem --- FIX: Changed subsystem to WINDOWS for headless command-line operation ---
-        cl.exe /EHsc /O2 /W3 /utf-8 /Fe:ProcessController.exe ProcessController.cpp /link /SUBSYSTEM:WINDOWS
-        
+        cl.exe /EHsc /O2 /W3 /utf-8 /Fe:ProcessController.exe ProcessController.cpp /link /SUBSYSTEM:CONSOLE
         mt.exe -manifest ProcessController.exe.manifest -outputresource:ProcessController.exe;1
       shell: cmd
 

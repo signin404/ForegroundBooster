@@ -169,10 +169,14 @@ std::vector<DWORD> FindProcessByName(const std::wstring& processName) {
 }
 
 void ClearAllJobSettings(HANDLE hJob) {
+    // 将所有限制标志清零，并重新应用，即可移除所有限制
     JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
+    // 关键：确保ActiveProcessLimit不会被意外设为1，清零结构体后其值为0，代表无限制
     SetInformationJobObject(hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
+    
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuLimit = {};
     SetInformationJobObject(hJob, JobObjectCpuRateControlInformation, &cpuLimit, sizeof(cpuLimit));
+    
     JOBOBJECT_NET_RATE_CONTROL_INFORMATION netLimit = {};
     netLimit.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
     SetInformationJobObject(hJob, JobObjectNetRateControlInformation, &netLimit, sizeof(netLimit));
@@ -254,6 +258,9 @@ private:
     HANDLE m_hJob;
     bool UpdateBasicLimits() {
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicLimit = {};
+        QueryInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit), NULL);
+        
+        basicLimit.LimitFlags = static_cast<JOBOBJECT_LIMIT_FLAGS>(0);
         if (affinity != 0) { basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicLimit.Affinity = affinity; }
         if (priority != -1) { basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicLimit.PriorityClass = priority; }
         if (scheduling != -1) { basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicLimit.SchedulingClass = scheduling; }
@@ -261,6 +268,9 @@ private:
             basicLimit.LimitFlags |= JOB_OBJECT_LIMIT_WORKINGSET;
             basicLimit.MinimumWorkingSetSize = workingSet.min * 1024 * 1024;
             basicLimit.MaximumWorkingSetSize = workingSet.max * 1024 * 1024;
+        } else {
+            basicLimit.MinimumWorkingSetSize = 0;
+            basicLimit.MaximumWorkingSetSize = 0;
         }
         return SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicLimit, sizeof(basicLimit));
     }
@@ -313,17 +323,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::vector<DWORD> pids;
-    
-    // --- FIX START: 使用独立的、目的明确的变量来存储标识符 ---
-    // 避免复用同一个变量来存储进程名和进程ID，这是导致问题的根源。
     std::wstring processNameIdentifier; 
     std::wstring processIdIdentifier;
-    // --- FIX END ---
-    
     bool isInputByName = false;
 
     if (isOneShotMode) {
-        // ... (One-shot mode logic remains the same, assuming it uses a similar corrected logic)
+        // ... 
     } else {
         while (pids.empty()) {
             std::wcout << L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ";
@@ -331,7 +336,6 @@ int main(int argc, char* argv[]) {
             std::getline(std::wcin, name_input);
             if (!name_input.empty()) {
                 isInputByName = true;
-                // --- FIX: 将输入的名字存入专门的变量 ---
                 processNameIdentifier = name_input;
                 pids = FindProcessByName(processNameIdentifier);
             } else {
@@ -340,7 +344,6 @@ int main(int argc, char* argv[]) {
                 std::wstring id_input;
                 std::getline(std::wcin, id_input);
                 try {
-                    // --- FIX: 将输入的ID存入专门的变量 ---
                     processIdIdentifier = id_input;
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
@@ -356,19 +359,14 @@ int main(int argc, char* argv[]) {
     for (DWORD pid : pids) std::wcout << L"  - PID: " << pid << std::endl;
     
     std::wstring jobName;
-    // --- FIX START: 根据输入模式，使用正确的、独立的标识符来构建Job名称 ---
-    // 这是关键修复。现在，当按名称查找时，我们确保使用进程名来创建唯一的Job Object，
-    // 所有同名进程都将被加入这同一个Job Object中。
     if (isInputByName) {
         jobName = L"Global\\ProcessControllerJob_Name_" + processNameIdentifier;
     } else {
         jobName = L"Global\\ProcessControllerJob_PID_" + processIdIdentifier;
     }
-    // --- FIX END ---
 
     g_hJob = CreateJobObjectW(NULL, jobName.c_str());
     if (g_hJob == NULL) {
-        // 如果Job已存在，GetLastError()会返回ERROR_ALREADY_EXISTS，此时需要打开它
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             g_hJob = OpenJobObjectW(JOB_OBJECT_ALL_ACCESS, FALSE, jobName.c_str());
             if (g_hJob == NULL) {
@@ -382,6 +380,14 @@ int main(int argc, char* argv[]) {
     }
     LogColor(COLOR_INFO, L"Job Object '%ws' 已创建/打开。\n", jobName.c_str());
     
+    // --- ***** THE ULTIMATE FIX ***** ---
+    // 无论作业对象是新建的还是打开的，都立即清除其所有限制。
+    // 这可以防止任何从先前运行中残留的限制（如ActiveProcessLimit=1）干扰本次操作，
+    // 从而确保所有找到的进程都能被成功加入。
+    ClearAllJobSettings(g_hJob);
+    LogColor(COLOR_INFO, L"已重置作业对象以确保状态干净，现在开始分配进程...\n");
+    // --- ***** END OF FIX ***** ---
+
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (hProcess) {
@@ -397,7 +403,7 @@ int main(int argc, char* argv[]) {
     
     JobController controller(g_hJob);
     if (isOneShotMode) {
-        // ... (One-shot mode logic remains the same)
+        // ...
     } else {
         while (true) {
             controller.DisplayStatus();
@@ -417,7 +423,7 @@ int main(int argc, char* argv[]) {
             } else if (choice == L"1") {
                 std::wcout << L"新亲和性 (例: 8,10,12-15) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
-                if (input == L"-1") controller.affinity = 0; else ParseAffinityString(input, controller.affinity);
+                if (input == L"-1") { controller.affinity = 0; } else { ParseAffinityString(input, controller.affinity); }
                 settingsChanged = true;
             } else if (choice == L"2") {
                 std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
@@ -460,7 +466,7 @@ int main(int argc, char* argv[]) {
             } else if (choice == L"8") {
                 std::wcout << L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ";
                 std::wstring input; std::getline(std::wcin, input);
-                if (input == L"-1") controller.workingSet.enabled = false; 
+                if (input == L"-1") { controller.workingSet.enabled = false; }
                 else if (!ParseWorkingSetString(input, controller.workingSet)) {
                     LogColor(COLOR_ERROR, L"无效输入！\n");
                 }

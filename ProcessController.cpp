@@ -39,7 +39,8 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
-bool g_ConsoleAttached = false;
+// g_ConsoleAttached is no longer needed for a true console app
+// bool g_ConsoleAttached = true; // It's always attached
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
@@ -47,15 +48,12 @@ bool g_ConsoleAttached = false;
 #define COLOR_ERROR 12
 #define COLOR_DEFAULT 7
 
-// --- FIX: Use native WriteConsoleW for all output ---
 void SafeWriteConsole(const std::wstring& text) {
-    if (!g_ConsoleAttached) return;
     DWORD charsWritten;
     WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), text.length(), &charsWritten, NULL);
 }
 
 void LogColor(int color, const wchar_t* format, ...) {
-    if (!g_ConsoleAttached) return;
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
     wchar_t buffer[2048];
@@ -67,9 +65,7 @@ void LogColor(int color, const wchar_t* format, ...) {
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
-// --- FIX: Use native ReadConsoleW for all input ---
 std::wstring SafeReadConsole() {
-    if (!g_ConsoleAttached) return L"";
     wchar_t buffer[512];
     DWORD charsRead;
     ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 512, &charsRead, NULL);
@@ -94,8 +90,7 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 }
 
 void EnableAllPrivileges() {
-    // FIX: Add a newline character at the beginning of the string for correct CMD formatting.
-    LogColor(COLOR_INFO, L"\n[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    LogColor(COLOR_INFO, L"[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
         L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
@@ -199,12 +194,8 @@ class JobController {
 public:
     JobController(HANDLE hJob) : m_hJob(hJob) {}
 
-    // FIX: This function no longer queries state. It creates clean structs and applies only the specified settings.
-    // This resolves the ERROR_INVALID_PARAMETER (87) issue.
     bool ApplySettings(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet) {
         bool overallSuccess = true;
-
-        // --- Basic Limits ---
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {}; 
         bool applyBasicLimits = false;
 
@@ -223,13 +214,12 @@ public:
             }
         }
 
-        // --- CPU Limits ---
         if (weight != -1 || cpuLimit != -1) {
             JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
             if (weight != -1) {
                 cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
                 cpuInfo.Weight = weight;
-            } else { // cpuLimit must be != -1
+            } else {
                 cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
                 cpuInfo.CpuRate = cpuLimit * 100;
             }
@@ -238,7 +228,6 @@ public:
             }
         }
 
-        // --- Network Limits ---
         if (dscp != -1) {
             JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
             netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG);
@@ -304,25 +293,17 @@ private:
     HANDLE m_hJob;
 };
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
-    bool isOneShotMode = wcslen(pCmdLine) > 0;
+// FIX: Entry point changed to wmain for a true Console Subsystem application
+int wmain(int argc, wchar_t* argv[]) {
+    // FIX: Mode detection is now based on argument count
+    bool isOneShotMode = argc > 1;
 
-    if (isOneShotMode) {
-        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            g_ConsoleAttached = true;
-        }
-    } else {
-        if (AllocConsole()) {
-            g_ConsoleAttached = true;
-        }
-    }
-
+    // A console app always has a console, so no Attach/Alloc logic is needed.
+    // The first LogColor call in EnableAllPrivileges now lacks the leading \n
+    // because the prompt is on a separate line.
     EnableAllPrivileges();
     
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return 1;
-
+    // FIX: Argument parsing is now done from argv, which is much simpler.
     std::map<std::wstring, std::wstring> args;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -332,7 +313,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             args[arg] = argv[++i];
         }
     }
-    LocalFree(argv);
 
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");
@@ -399,7 +379,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     
     JobController controller(g_hJob);
 
-    // FIX: Apply settings BEFORE assigning processes for robustness.
     if (isOneShotMode) {
         LogColor(COLOR_INFO, L"----------------------------------------------------\n");
         LogColor(COLOR_INFO, L"正在应用一次性设置...\n");
@@ -436,7 +415,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (!controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
             LogColor(COLOR_ERROR, L"应用设置失败！错误码: %lu\n", GetLastError());
             CloseHandle(g_hJob);
-            exit(1);
+            return 1;
         }
     }
 
@@ -448,7 +427,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 LogColor(COLOR_SUCCESS, L"  -> 成功分配 PID: %lu\n", pid);
             } else {
                 DWORD lastError = GetLastError();
-                // FIX: Treat error 5 as a warning with a clear message.
                 if (lastError == 5) {
                     LogColor(COLOR_WARNING, L"  -> 警告: 无法分配 PID %lu (错误码: 5 - 拒绝访问, 进程可能已属于另一个Job)\n", pid);
                 } else {
@@ -465,11 +443,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         LogColor(COLOR_SUCCESS, L"所有操作完成。脚本将退出，限制将持续有效。\n");
         CloseHandle(g_hJob);
         g_hJob = NULL;
-        if (g_ConsoleAttached) {
-            FreeConsole();
-        }
-        // FIX: Use exit(0) for immediate and clean termination.
-        exit(0);
+        return 0; // A standard return from a console app is sufficient.
     } else {
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
@@ -539,10 +513,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet);
         }
         CleanupAndExit();
-    }
-
-    if (g_ConsoleAttached) {
-        FreeConsole();
     }
 
     return 0;

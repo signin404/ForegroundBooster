@@ -66,7 +66,7 @@ void SafeWriteConsole(const std::wstring& text) {
 void SetConsoleColorRGB(int r, int g, int b) {
     if (!g_ConsoleAttached) return;
     wchar_t color_buffer[64];
-    swprintf(color_buffer, 64, L"\x1b[38;2;%d;%d;%dm", r, g, b);
+swprintf(color_buffer, 64, L"\x1b[38;2;%d;%d;%dm", r, g, b);
     SafeWriteConsole(color_buffer);
 }
 
@@ -732,7 +732,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 if (input == L"-1") { workingSet = {0, 0}; }
                 else {
                     size_t dash_pos = input.find(L'-');
-                    if (dash_pos != std::wstring::npos) { try { workingSet.first = std::stoul(ws_str.substr(0, dash_pos)); workingSet.second = std::stoul(ws_str.substr(dash_pos + 1)); } catch(...) {} }
+                    // FIX C2065: Use the correct variable 'input' instead of 'ws_str'.
+                    if (dash_pos != std::wstring::npos) { try { workingSet.first = std::stoul(input.substr(0, dash_pos)); workingSet.second = std::stoul(input.substr(dash_pos + 1)); } catch(...) {} }
                 }
             } else if (choice == L"exit") {
                 break;
@@ -743,7 +744,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
             
             if (settingChanged) {
-                int s, f; // Dummy variables, not used.
+                int s, f;
                 JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
             }
         }

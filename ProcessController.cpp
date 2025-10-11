@@ -10,8 +10,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
-#include <io.h>
-#include <fcntl.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
 
@@ -49,6 +47,13 @@ bool g_ConsoleAttached = false;
 #define COLOR_ERROR 12
 #define COLOR_DEFAULT 7
 
+// --- FIX: Use native WriteConsoleW for all output ---
+void SafeWriteConsole(const std::wstring& text) {
+    if (!g_ConsoleAttached) return;
+    DWORD charsWritten;
+    WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), text.length(), &charsWritten, NULL);
+}
+
 void LogColor(int color, const wchar_t* format, ...) {
     if (!g_ConsoleAttached) return;
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -58,8 +63,20 @@ void LogColor(int color, const wchar_t* format, ...) {
     va_start(args, format);
     vswprintf(buffer, sizeof(buffer) / sizeof(wchar_t), format, args);
     va_end(args);
-    std::wcout << buffer;
+    SafeWriteConsole(buffer);
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
+}
+
+// --- FIX: Use native ReadConsoleW for all input ---
+std::wstring SafeReadConsole() {
+    if (!g_ConsoleAttached) return L"";
+    wchar_t buffer[512];
+    DWORD charsRead;
+    ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 512, &charsRead, NULL);
+    if (charsRead >= 2 && buffer[charsRead - 2] == L'\r' && buffer[charsRead - 1] == L'\n') {
+        return std::wstring(buffer, charsRead - 2);
+    }
+    return std::wstring(buffer, charsRead);
 }
 
 bool EnablePrivilege(LPCWSTR privilegeName) {
@@ -91,17 +108,18 @@ void EnableAllPrivileges() {
         if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, L"  -> 成功启用: %ws\n", priv);
         else LogColor(COLOR_WARNING, L"  -> 警告: 无法启用 %ws\n", priv);
     }
-    if (g_ConsoleAttached) std::wcout << L"----------------------------------------------------\n" << std::endl;
+    SafeWriteConsole(L"----------------------------------------------------\n\n");
 }
 
 void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    std::wcout << label;
-    for (size_t i = label.length(); i < 25; ++i) std::wcout << L" ";
-    std::wcout << L": ";
+    std::wstring text = label;
+    for (size_t i = label.length(); i < 25; ++i) text += L" ";
+    text += L": ";
+    SafeWriteConsole(text);
     if (value == L"已禁用") SetConsoleTextAttribute(hConsole, COLOR_ERROR);
     else SetConsoleTextAttribute(hConsole, COLOR_SUCCESS);
-    std::wcout << value << std::endl;
+    SafeWriteConsole(value + L"\n");
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
@@ -217,8 +235,16 @@ public:
     }
 
     void DisplayStatus() {
-        system("cls");
-        std::wcout << L"--- 进程控制器菜单 ---\n";
+        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        GetConsoleScreenBufferInfo(hConsole, &csbi);
+        DWORD dwConSize = csbi.dwSize.X * csbi.dwSize.Y;
+        COORD coord = {0, 0};
+        DWORD dwCharsWritten;
+        FillConsoleOutputCharacter(hConsole, (TCHAR)' ', dwConSize, coord, &dwCharsWritten);
+        SetConsoleCursorPosition(hConsole, coord);
+
+        SafeWriteConsole(L"--- 进程控制器菜单 ---\n");
         PrintStatusLine(L"-1. 禁用所有限制", L"");
         JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
@@ -254,42 +280,22 @@ public:
         }
         PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", workingSet_str);
         
-        std::wcout << L"----------------------------------------------------\n";
+        SafeWriteConsole(L"----------------------------------------------------\n");
     }
 
 private:
     HANDLE m_hJob;
 };
 
-// --- FIX: This function is the key to correctly re-associating I/O streams ---
-void RedirectIOToConsole() {
-    FILE* f_out, *f_in, *f_err;
-    freopen_s(&f_out, "CONOUT$", "w", stdout);
-    freopen_s(&f_err, "CONOUT$", "w", stderr);
-    freopen_s(&f_in, "CONIN$", "r", stdin);
-
-    std::wcout.clear();
-    std::wcin.clear();
-    std::wcerr.clear();
-}
-
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         g_ConsoleAttached = true;
-        RedirectIOToConsole();
     } else if (!isOneShotMode) {
         if (AllocConsole()) {
             g_ConsoleAttached = true;
-            RedirectIOToConsole();
         }
-    }
-    
-    if (g_ConsoleAttached) {
-        _setmode(_fileno(stdout), _O_U16TEXT);
-        _setmode(_fileno(stdin),  _O_U16TEXT);
-        _setmode(_fileno(stderr), _O_U16TEXT);
     }
 
     EnableAllPrivileges();
@@ -332,24 +338,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     } else {
         while (pids.empty()) {
-            std::wcout << L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ";
-            std::wstring name_input;
-            std::getline(std::wcin, name_input);
+            SafeWriteConsole(L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ");
+            std::wstring name_input = SafeReadConsole();
             if (!name_input.empty()) {
                 isInputByName = true;
                 jobIdentifier = name_input;
                 pids = FindProcessByName(jobIdentifier);
             } else {
                 isInputByName = false;
-                std::wcout << L"请输入目标进程ID: ";
-                std::wstring id_input;
-                std::getline(std::wcin, id_input);
+                SafeWriteConsole(L"请输入目标进程ID: ");
+                std::wstring id_input = SafeReadConsole();
                 try {
                     jobIdentifier = id_input;
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
-            if (pids.empty()) std::wcerr << L"未找到任何目标进程, 请重试。" << std::endl;
+            if (pids.empty()) LogColor(COLOR_ERROR, L"未找到任何目标进程, 请重试。\n");
         }
     }
     if (pids.empty()) {
@@ -433,23 +437,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         while (true) {
             controller.DisplayStatus();
-            std::wcout << L"请选择要修改的功能 (-1, 1-8), 或输入 'exit' 退出: ";
-            std::wstring choice;
-            std::getline(std::wcin, choice);
+            SafeWriteConsole(L"请选择要修改的功能 (-1, 1-8), 或输入 'exit' 退出: ");
+            std::wstring choice = SafeReadConsole();
             if (choice == L"-1") {
                 ClearAllJobSettings(g_hJob);
                 LogColor(COLOR_SUCCESS, L"所有限制已成功禁用！\n");
-                std::wcout << L"按回车键继续...";
-                std::wstring dummy;
-                std::getline(std::wcin, dummy);
+                SafeWriteConsole(L"按回车键继续...");
+                SafeReadConsole();
                 continue;
             } else if (choice == L"1") {
-                std::wcout << L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ";
-                std::wstring input; std::getline(std::wcin, input);
+                SafeWriteConsole(L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
                 if (input == L"-1") affinity = 0; else ParseAffinityString(input, affinity);
             } else if (choice == L"2") {
-                std::wcout << L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ";
-                std::wstring w_input; std::getline(std::wcin, w_input);
+                SafeWriteConsole(L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
+                std::wstring w_input = SafeReadConsole();
                 std::transform(w_input.begin(), w_input.end(), w_input.begin(), ::towlower);
                 if (w_input == L"-1") priority = -1;
                 else if (w_input == L"idle") priority = IDLE_PRIORITY_CLASS;
@@ -459,24 +461,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 else if (w_input == L"high") priority = HIGH_PRIORITY_CLASS;
                 else if (w_input == L"realtime") priority = REALTIME_PRIORITY_CLASS;
             } else if (choice == L"3") {
-                std::wcout << L"新调度优先级 (0-9) 或 -1 禁用: ";
-                std::wstring input; std::getline(std::wcin, input);
+                SafeWriteConsole(L"新调度优先级 (0-9) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
                 if (input == L"-1") scheduling = -1; else try { scheduling = std::stoi(input); } catch(...) {}
             } else if (choice == L"4") {
-                std::wcout << L"新时间片权重 (1-9) 或 -1 禁用: ";
-                std::wstring input; std::getline(std::wcin, input);
+                SafeWriteConsole(L"新时间片权重 (1-9) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
                 if (input == L"-1") weight = -1; else try { weight = std::stoi(input); cpuLimit = -1; } catch(...) {}
             } else if (choice == L"5") {
-                std::wcout << L"新数据包优先级 (0-63) 或 -1 禁用: ";
-                std::wstring input; std::getline(std::wcin, input);
+                SafeWriteConsole(L"新数据包优先级 (0-63) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
                 if (input == L"-1") dscp = -1; else try { dscp = std::stoi(input); } catch(...) {}
             } else if (choice == L"6") {
-                std::wcout << L"新CPU使用率上限 (1-100) 或 -1 禁用: ";
-                std::wstring input; std::getline(std::wcin, input);
+                SafeWriteConsole(L"新CPU使用率上限 (1-100) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
                 if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
             } else if (choice == L"8") {
-                std::wcout << L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ";
-                std::wstring input; std::getline(std::wcin, input);
+                SafeWriteConsole(L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ");
+                std::wstring input = SafeReadConsole();
                 if (input == L"-1") { workingSet = {0, 0}; }
                 else {
                     size_t dash_pos = input.find(L'-');
@@ -490,9 +492,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             } else if (choice == L"exit") {
                 break;
             } else {
-                std::wcout << L"无效的选择, 请按回车键重试...";
-                std::wstring dummy;
-                std::getline(std::wcin, dummy);
+                SafeWriteConsole(L"无效的选择, 请按回车键重试...");
+                SafeReadConsole();
                 continue;
             }
             controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet);

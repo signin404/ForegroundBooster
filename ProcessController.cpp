@@ -311,36 +311,34 @@ public:
             overallSuccess = false;
         }
 
-        // 步骤 1: 创建一个完全禁用的配置，并将其应用到作业对象，以清除任何现有状态。
-        JOBOBJECT_NET_RATE_CONTROL_INFORMATION resetNetInfo = {}; // ControlFlags 默认为 0
-        if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &resetNetInfo, sizeof(resetNetInfo))) {
-            // 如果清零操作失败，则标记为失败并提前返回。
+        JOBOBJECT_NET_RATE_CONTROL_INFORMATION resetInfo = {}; // ControlFlags 和所有成员都为 0
+        SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &resetInfo, sizeof(resetInfo));
+        // 我们暂时忽略此调用的返回值，因为最终决定成功与否的是下面的第二次调用。
+
+        // 步骤 2: 根据主循环中保存的当前期望状态，从零开始构建最终的配置。
+        JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
+
+        // 如果 netLimit 不是 -1，则将其配置添加到最终设置中。
+        if (netLimit != -1) {
+            netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
+            netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
+        }
+
+        // 如果 dscp 不是 -1，则将其配置添加到最终设置中。
+        if (dscp != -1) {
+            netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
+            netInfo.DscpTag = (BYTE)dscp;
+        }
+
+        // 只有当需要启用至少一个功能时，才添加总的启用开关。
+        if (netInfo.ControlFlags != 0) {
+            netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE;
+        }
+
+        // 步骤 3: 将最终构建好的配置应用到已被重置的作业对象上。
+        // 整个操作的成功与否取决于这次调用的结果。
+        if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
             overallSuccess = false;
-        } else {
-            // 步骤 2: 仅当清零成功后，才根据当前用户输入构建并应用新的配置。
-            JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {}; // 再次从一个干净的结构体开始
-
-            // 根据 netLimit 的值设置带宽限制
-            if (netLimit != -1) {
-                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
-                netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
-            }
-
-            // 根据 dscp 的值设置DSCP
-            if (dscp != -1) {
-                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
-                netInfo.DscpTag = (BYTE)dscp;
-            }
-
-            // 只有当至少一个子功能（带宽或DSCP）被启用时，才添加总的启用标志
-            if (netInfo.ControlFlags != 0) {
-                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE;
-            }
-
-            // 将最终构建好的设置应用到作业对象
-            if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
-                overallSuccess = false;
-            }
         }
         
         return overallSuccess;

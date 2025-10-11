@@ -290,9 +290,15 @@ private:
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        g_ConsoleAttached = true;
-    } else if (!isOneShotMode) {
+    // --- FIX: Revised Console Handling for All Scenarios ---
+    if (isOneShotMode) {
+        // In command-line mode, only attach if a parent console exists (like cmd.exe).
+        // If launched from explorer.exe, this will fail, and the app will run silently.
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            g_ConsoleAttached = true;
+        }
+    } else {
+        // In interactive mode (double-clicked), we must have a console.
         if (AllocConsole()) {
             g_ConsoleAttached = true;
         }
@@ -315,10 +321,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
     LocalFree(argv);
 
+    // CtrlHandler is primarily for interactive mode now.
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");
-        return 1;
+        // Non-critical, so we don't exit.
     }
+
     std::vector<DWORD> pids;
     std::wstring jobIdentifier;
     bool isInputByName = false;
@@ -337,6 +345,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             return 1;
         }
     } else {
+        // Interactive mode logic remains the same
         while (pids.empty()) {
             SafeWriteConsole(L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ");
             std::wstring name_input = SafeReadConsole();
@@ -356,6 +365,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (pids.empty()) LogColor(COLOR_ERROR, L"未找到任何目标进程, 请重试。\n");
         }
     }
+
     if (pids.empty()) {
         LogColor(COLOR_ERROR, L"未找到任何目标进程, 脚本将退出。\n");
         return 1;
@@ -426,11 +436,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             }
         }
         
-        if (controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) LogColor(COLOR_SUCCESS, L"设置已成功应用。脚本将退出，限制将持续有效。\n");
-        else LogColor(COLOR_ERROR, L"应用设置失败！错误码: %lu\n", GetLastError());
+        if (controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
+            LogColor(COLOR_SUCCESS, L"设置已成功应用。脚本将退出，限制将持续有效。\n");
+        } else {
+            LogColor(COLOR_ERROR, L"应用设置失败！错误码: %lu\n", GetLastError());
+        }
+        
+        // --- FIX: Cleanly close the handle and exit the process ---
         CloseHandle(g_hJob);
         g_hJob = NULL;
+        if (g_ConsoleAttached) {
+            FreeConsole();
+        }
+        return 0; // Explicitly return to terminate the process and return control to caller.
+
     } else {
+        // Interactive mode logic remains the same
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};

@@ -13,13 +13,13 @@
 #include <io.h>
 #include <fcntl.h>
 #include <tlhelp32.h>
-#include <shellapi.h> // Header for CommandLineToArgvW
+#include <shellapi.h>
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib") // --- FIX: Added the missing library for CommandLineToArgvW ---
+#pragma comment(lib, "shell32.lib")
 
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
@@ -261,31 +261,23 @@ private:
     HANDLE m_hJob;
 };
 
-void RedirectIOToConsole() {
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    freopen_s(&f, "CONOUT$", "w", stderr);
-    freopen_s(&f, "CONIN$", "r", stdin);
-    std::wcout.clear();
-    std::wcin.clear();
-    std::wcerr.clear();
-    _setmode(_fileno(stdout), _O_U16TEXT);
-    _setmode(_fileno(stdin),  _O_U16TEXT);
-    _setmode(_fileno(stderr), _O_U16TEXT);
-}
-
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
-    if (isOneShotMode) {
-        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-            g_ConsoleAttached = true;
-            RedirectIOToConsole();
-        }
-    } else {
+    // --- FIX: Simplified and corrected console setup ---
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        g_ConsoleAttached = true;
+        // We attached to an existing console, set its mode to Unicode
+        _setmode(_fileno(stdout), _O_U16TEXT);
+        _setmode(_fileno(stdin),  _O_U16TEXT);
+        _setmode(_fileno(stderr), _O_U16TEXT);
+    } else if (!isOneShotMode) {
+        // Only create a new console if we are in interactive mode
         if (AllocConsole()) {
             g_ConsoleAttached = true;
-            RedirectIOToConsole();
+            _setmode(_fileno(stdout), _O_U16TEXT);
+            _setmode(_fileno(stdin),  _O_U16TEXT);
+            _setmode(_fileno(stderr), _O_U16TEXT);
         }
     }
 
@@ -496,5 +488,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         CleanupAndExit();
     }
+
+    // --- FIX: Detach from the console before exiting ---
+    if (g_ConsoleAttached) {
+        FreeConsole();
+    }
+
     return 0;
 }

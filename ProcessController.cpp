@@ -39,8 +39,7 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 #endif
 
 HANDLE g_hJob = NULL;
-// g_ConsoleAttached is no longer needed for a true console app
-// bool g_ConsoleAttached = true; // It's always attached
+bool g_ConsoleAttached = false;
 
 #define COLOR_INFO 11
 #define COLOR_SUCCESS 10
@@ -49,11 +48,13 @@ HANDLE g_hJob = NULL;
 #define COLOR_DEFAULT 7
 
 void SafeWriteConsole(const std::wstring& text) {
+    if (!g_ConsoleAttached) return;
     DWORD charsWritten;
     WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), text.length(), &charsWritten, NULL);
 }
 
 void LogColor(int color, const wchar_t* format, ...) {
+    if (!g_ConsoleAttached) return;
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     SetConsoleTextAttribute(hConsole, color);
     wchar_t buffer[2048];
@@ -66,6 +67,7 @@ void LogColor(int color, const wchar_t* format, ...) {
 }
 
 std::wstring SafeReadConsole() {
+    if (!g_ConsoleAttached) return L"";
     wchar_t buffer[512];
     DWORD charsRead;
     ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, 512, &charsRead, NULL);
@@ -90,7 +92,8 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 }
 
 void EnableAllPrivileges() {
-    LogColor(COLOR_INFO, L"[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    // FIX: Add back the leading newline for correct formatting when attaching to cmd.
+    LogColor(COLOR_INFO, L"\n[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
         L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
@@ -293,17 +296,30 @@ private:
     HANDLE m_hJob;
 };
 
-// FIX: Entry point changed to wmain for a true Console Subsystem application
-int wmain(int argc, wchar_t* argv[]) {
-    // FIX: Mode detection is now based on argument count
-    bool isOneShotMode = argc > 1;
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    bool isOneShotMode = wcslen(pCmdLine) > 0;
 
-    // A console app always has a console, so no Attach/Alloc logic is needed.
-    // The first LogColor call in EnableAllPrivileges now lacks the leading \n
-    // because the prompt is on a separate line.
+    // FIX: Final console management logic for a GUI Subsystem app
+    g_ConsoleAttached = false;
+    if (isOneShotMode) {
+        // If launched from cmd.exe, this will succeed.
+        // If launched from explorer.exe, this will fail, and the app will run silently.
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            g_ConsoleAttached = true;
+        }
+    } else {
+        // Interactive mode (double-clicked), so we must create a console.
+        if (AllocConsole()) {
+            g_ConsoleAttached = true;
+        }
+    }
+
     EnableAllPrivileges();
     
-    // FIX: Argument parsing is now done from argv, which is much simpler.
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 1;
+
     std::map<std::wstring, std::wstring> args;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -313,6 +329,7 @@ int wmain(int argc, wchar_t* argv[]) {
             args[arg] = argv[++i];
         }
     }
+    LocalFree(argv);
 
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");
@@ -415,7 +432,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (!controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet)) {
             LogColor(COLOR_ERROR, L"应用设置失败！错误码: %lu\n", GetLastError());
             CloseHandle(g_hJob);
-            return 1;
+            exit(1);
         }
     }
 
@@ -443,8 +460,14 @@ int wmain(int argc, wchar_t* argv[]) {
         LogColor(COLOR_SUCCESS, L"所有操作完成。脚本将退出，限制将持续有效。\n");
         CloseHandle(g_hJob);
         g_hJob = NULL;
-        return 0; // A standard return from a console app is sufficient.
+        if (g_ConsoleAttached) {
+            // Detach from the console before exiting to prevent hanging.
+            FreeConsole();
+        }
+        // Forcefully exit to ensure control is returned to the caller.
+        exit(0);
     } else {
+        // Interactive mode loop
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};
@@ -513,6 +536,10 @@ int wmain(int argc, wchar_t* argv[]) {
             controller.ApplySettings(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet);
         }
         CleanupAndExit();
+    }
+
+    if (g_ConsoleAttached) {
+        FreeConsole();
     }
 
     return 0;

@@ -283,54 +283,50 @@ public:
         }
     }
 
+    // FIX: Rewritten to ALWAYS set all categories of limits, ensuring -1 correctly disables them.
     static bool ApplySettingsToSingle(HANDLE m_hJob, DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, int netLimit, const std::pair<size_t, size_t>& workingSet) {
         bool overallSuccess = true;
-        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {}; 
-        bool applyBasicLimits = false;
 
-        if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; applyBasicLimits = true; }
-        if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; applyBasicLimits = true; }
-        if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; applyBasicLimits = true; }
+        // --- Basic Limits ---
+        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {}; 
+        if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; }
+        if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; }
+        if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; }
         if (workingSet.first > 0 && workingSet.second > 0) {
             basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_WORKINGSET;
             basicInfo.MinimumWorkingSetSize = workingSet.first * 1024 * 1024;
             basicInfo.MaximumWorkingSetSize = workingSet.second * 1024 * 1024;
-            applyBasicLimits = true;
         }
-        if (applyBasicLimits) {
-            if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
-                overallSuccess = false;
-            }
+        if (!SetInformationJobObject(m_hJob, JobObjectBasicLimitInformation, &basicInfo, sizeof(basicInfo))) {
+            overallSuccess = false;
         }
 
-        if (weight != -1 || cpuLimit != -1) {
-            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
-            if (weight != -1) {
-                cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
-                cpuInfo.Weight = weight;
-            } else {
-                cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-                cpuInfo.CpuRate = cpuLimit * 100;
-            }
-            if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
-                overallSuccess = false;
-            }
+        // --- CPU Limits ---
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo = {};
+        if (weight != -1) {
+            cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+            cpuInfo.Weight = weight;
+        } else if (cpuLimit != -1) {
+            cpuInfo.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpuInfo.CpuRate = cpuLimit * 100;
+        }
+        if (!SetInformationJobObject(m_hJob, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo))) {
+            overallSuccess = false;
         }
 
-        if (dscp != -1 || netLimit != -1) {
-            JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
-            netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
-            if (netLimit != -1) {
-                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
-                netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
-            }
-            if (dscp != -1) {
-                netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
-                netInfo.DscpTag = (BYTE)dscp;
-            }
-            if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
-                overallSuccess = false;
-            }
+        // --- Network Limits ---
+        JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
+        netInfo.ControlFlags = static_cast<JOB_OBJECT_NET_RATE_CONTROL_FLAGS>(0);
+        if (netLimit != -1) {
+            netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
+            netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
+        }
+        if (dscp != -1) {
+            netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE | JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
+            netInfo.DscpTag = (BYTE)dscp;
+        }
+        if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
+            overallSuccess = false;
         }
         
         return overallSuccess;
@@ -489,7 +485,7 @@ public:
         
         SafeWriteConsole(L"----------------------------------------------------\n");
     }
-}; // FIX C1075: Added the missing closing brace for the class definition.
+};
 
 void DisplayHelp() {
     if (!g_ConsoleAttached) {
@@ -693,8 +689,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             JobController::DisplayAggregatedStatus();
             SafeWriteConsole(L"请选择要修改的功能 (0-8), 或输入 'exit' 退出: ");
             std::wstring choice = SafeReadConsole();
-            bool settingChanged = true;
-
+            
             if (choice == L"0") {
                 ClearAllJobSettings();
                 affinity = 0;
@@ -709,31 +704,38 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 SafeWriteConsole(L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") affinity = 0; else ParseAffinityString(input, affinity);
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"2") {
                 SafeWriteConsole(L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
                 std::wstring w_input = SafeReadConsole();
                 std::transform(w_input.begin(), w_input.end(), w_input.begin(), ::towlower);
                 if (w_input == L"-1") priority = -1; else if (w_input == L"idle") priority = IDLE_PRIORITY_CLASS; else if (w_input == L"belownormal") priority = BELOW_NORMAL_PRIORITY_CLASS; else if (w_input == L"normal") priority = NORMAL_PRIORITY_CLASS; else if (w_input == L"abovenormal") priority = ABOVE_NORMAL_PRIORITY_CLASS; else if (w_input == L"high") priority = HIGH_PRIORITY_CLASS; else if (w_input == L"realtime") priority = REALTIME_PRIORITY_CLASS;
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"3") {
                 SafeWriteConsole(L"新调度优先级 (0-9) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") scheduling = -1; else try { scheduling = std::stoi(input); } catch(...) {}
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"4") {
                 SafeWriteConsole(L"新时间片权重 (1-9) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") weight = -1; else try { weight = std::stoi(input); cpuLimit = -1; } catch(...) {}
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"5") {
                 SafeWriteConsole(L"新数据包优先级 (0-63) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") dscp = -1; else try { dscp = std::stoi(input); } catch(...) {}
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"6") {
                 SafeWriteConsole(L"新CPU使用率上限 (1-100) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"7") {
                 SafeWriteConsole(L"新传出带宽上限 (KB/s) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") netLimit = -1; else try { netLimit = std::stoi(input); } catch(...) {}
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"8") {
                 SafeWriteConsole(L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
@@ -742,17 +744,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     size_t dash_pos = input.find(L'-');
                     if (dash_pos != std::wstring::npos) { try { workingSet.first = std::stoul(input.substr(0, dash_pos)); workingSet.second = std::stoul(input.substr(dash_pos + 1)); } catch(...) {} }
                 }
+                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, *(new int), *(new int));
             } else if (choice == L"exit") {
                 break;
             } else {
                 SafeWriteConsole(L"无效的选择, 请按回车键重试...");
                 SafeReadConsole();
-                settingChanged = false;
-            }
-            
-            if (settingChanged) {
-                int successCount, failCount;
-                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, successCount, failCount);
             }
         }
         CleanupAndExit();

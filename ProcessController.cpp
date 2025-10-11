@@ -41,11 +41,22 @@ typedef struct _JOBOBJECT_NET_RATE_CONTROL_INFORMATION {
 std::vector<HANDLE> g_hJobs;
 bool g_ConsoleAttached = false;
 
-#define COLOR_INFO 11
-#define COLOR_SUCCESS 10
-#define COLOR_WARNING 14
-#define COLOR_ERROR 12
-#define COLOR_DEFAULT 7
+// --- FIX: Define RGB Colors ---
+#define COLOR_LABEL_R 38
+#define COLOR_LABEL_G 160
+#define COLOR_LABEL_B 218
+
+#define COLOR_ENABLED_R 246
+#define COLOR_ENABLED_G 182
+#define COLOR_ENABLED_B 78
+
+#define COLOR_DISABLED_R 217
+#define COLOR_DISABLED_G 66
+#define COLOR_DISABLED_B 53
+
+#define COLOR_SUCCESS_R 118
+#define COLOR_SUCCESS_G 202
+#define COLOR_SUCCESS_B 83
 
 void SafeWriteConsole(const std::wstring& text) {
     if (!g_ConsoleAttached) return;
@@ -53,17 +64,27 @@ void SafeWriteConsole(const std::wstring& text) {
     WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), text.c_str(), text.length(), &charsWritten, NULL);
 }
 
+// --- FIX: New functions for RGB color support ---
+void SetConsoleColorRGB(int r, int g, int b) {
+    if (!g_ConsoleAttached) return;
+    wchar_t color_buffer[64];
+    swprintf(color_buffer, 64, L"\x1b[38;2;%d;%d;%dm", r, g, b);
+    SafeWriteConsole(color_buffer);
+}
+
+void ResetConsoleColor() {
+    if (!g_ConsoleAttached) return;
+    SafeWriteConsole(L"\x1b[0m");
+}
+
 void LogColor(int color, const wchar_t* format, ...) {
     if (!g_ConsoleAttached) return;
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    SetConsoleTextAttribute(hConsole, color);
     wchar_t buffer[2048];
     va_list args;
     va_start(args, format);
     vswprintf(buffer, sizeof(buffer) / sizeof(wchar_t), format, args);
     va_end(args);
     SafeWriteConsole(buffer);
-    SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
 std::wstring SafeReadConsole() {
@@ -92,7 +113,9 @@ bool EnablePrivilege(LPCWSTR privilegeName) {
 }
 
 void EnableAllPrivileges() {
-    LogColor(COLOR_INFO, L"\n[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
+    SafeWriteConsole(L"\n[权限提升] 正在尝试为当前进程启用所有可用特权...\n");
+    ResetConsoleColor();
     const LPCWSTR privileges[] = {
         L"SeDebugPrivilege", L"SeTakeOwnershipPrivilege", L"SeBackupPrivilege", L"SeRestorePrivilege",
         L"SeLoadDriverPrivilege", L"SeSystemEnvironmentPrivilege", L"SeSecurityPrivilege",
@@ -103,28 +126,72 @@ void EnableAllPrivileges() {
         L"SeTimeZonePrivilege", L"SeCreateSymbolicLinkPrivilege", L"SeDelegateSessionUserImpersonatePrivilege"
     };
     for (const auto& priv : privileges) {
-        if (EnablePrivilege(priv)) LogColor(COLOR_SUCCESS, L"  -> 成功启用: %ws\n", priv);
-        else LogColor(COLOR_WARNING, L"  -> 警告: 无法启用 %ws\n", priv);
+        if (EnablePrivilege(priv)) {
+            SetConsoleColorRGB(COLOR_SUCCESS_R, COLOR_SUCCESS_G, COLOR_SUCCESS_B);
+            LogColor(0, L"  -> 成功启用: %ws\n", priv);
+        } else {
+            SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
+            LogColor(0, L"  -> 警告: 无法启用 %ws\n", priv);
+        }
+        ResetConsoleColor();
     }
     SafeWriteConsole(L"----------------------------------------------------\n\n");
 }
 
-// FIX: Modified to support aggregated status display.
+// FIX: Rewritten to use RGB colors and new format.
 void PrintStatusLine(const std::wstring& label, const std::wstring& value, int successCount = -1, int failCount = -1) {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    std::wstring text = label;
-    for (size_t i = label.length(); i < 25; ++i) text += L" ";
+    SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
+    std::wstring paddedLabel = label;
+    for (size_t i = label.length(); i < 25; ++i) paddedLabel += L" ";
+    SafeWriteConsole(paddedLabel + L": ");
     
-    std::wstringstream wss;
-    wss << L": " << value;
-    
-    if (successCount != -1 && failCount != -1 && (successCount + failCount > 1)) {
-        wss << L" | 成功:" << successCount << L" | 失败:" << failCount;
+    if (value == L"已禁用" || value == L"混合值") {
+        SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
+    } else {
+        SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
     }
-    text += wss.str();
+    SafeWriteConsole(value);
 
-    SafeWriteConsole(text + L"\n");
-    SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
+    if (successCount != -1 && failCount != -1 && (successCount + failCount > 1)) {
+        ResetConsoleColor();
+        SafeWriteConsole(L" | ");
+        SetConsoleColorRGB(COLOR_SUCCESS_R, COLOR_SUCCESS_G, COLOR_SUCCESS_B);
+        SafeWriteConsole(L"成功:" + std::to_wstring(successCount));
+        ResetConsoleColor();
+        SafeWriteConsole(L" | ");
+        SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
+        SafeWriteConsole(L"失败:" + std::to_wstring(failCount));
+    }
+    
+    ResetConsoleColor();
+    SafeWriteConsole(L"\n");
+}
+
+// FIX: New function to convert affinity mask to a human-readable string.
+std::wstring MaskToAffinityString(DWORD_PTR mask) {
+    if (mask == 0) return L"已禁用";
+    std::wstringstream wss;
+    bool first = true;
+    for (int i = 0; i < sizeof(DWORD_PTR) * 8; ++i) {
+        if ((mask >> i) & 1) {
+            int start = i;
+            while (i + 1 < sizeof(DWORD_PTR) * 8 && ((mask >> (i + 1)) & 1)) {
+                i++;
+            }
+            int end = i;
+
+            if (!first) {
+                wss << L" ";
+            }
+            if (start == end) {
+                wss << start;
+            } else {
+                wss << start << L"-" << end;
+            }
+            first = false;
+        }
+    }
+    return wss.str();
 }
 
 bool ParseAffinityString(std::wstring w_s, DWORD_PTR& mask) {
@@ -183,7 +250,9 @@ void ClearAllJobSettings() {
 
 void CleanupAndExit() {
     if (!g_hJobs.empty()) {
-        LogColor(COLOR_WARNING, L"\n正在退出... 限制将保持生效。\n");
+        SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
+        SafeWriteConsole(L"\n正在退出... 限制将保持生效。\n");
+        ResetConsoleColor();
         for (HANDLE hJob : g_hJobs) {
             CloseHandle(hJob);
         }
@@ -204,10 +273,8 @@ BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
 
 class JobController {
 public:
-    // FIX: Constructor removed, methods are now static as they operate on the global g_hJobs.
     JobController() {}
 
-    // FIX: ApplySettings now operates on all global job handles.
     static void ApplySettingsToAll(DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, const std::pair<size_t, size_t>& workingSet, int& successCount, int& failCount) {
         successCount = 0;
         failCount = 0;
@@ -266,7 +333,6 @@ public:
         return overallSuccess;
     }
 
-    // FIX: Major refactor to display aggregated status from all jobs.
     static void DisplayAggregatedStatus() {
         if (g_hJobs.empty()) return;
 
@@ -279,22 +345,41 @@ public:
         FillConsoleOutputCharacter(hConsole, (TCHAR)' ', dwConSize, coord, &dwCharsWritten);
         SetConsoleCursorPosition(hConsole, coord);
 
+        SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
         SafeWriteConsole(L"--- 进程控制器菜单 ---\n");
-        PrintStatusLine(L"-1. 禁用所有限制", L"");
+        ResetConsoleColor();
+        
+        // FIX: "0" option with no colon
+        SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
+        std::wstring disableLabel = L"0. 禁用所有限制";
+        for (size_t i = disableLabel.length(); i < 27; ++i) disableLabel += L" ";
+        SafeWriteConsole(disableLabel + L"\n");
+        ResetConsoleColor();
 
         std::map<std::wstring, int> counts;
         
-        // Helper lambda to find the most common value and counts
         auto findMostCommon = [&](const std::map<std::wstring, int>& valueCounts) {
             std::pair<std::wstring, int> mostCommon = {L"已禁用", 0};
-            if (valueCounts.count(L"已禁用")) {
-                mostCommon.second = valueCounts.at(L"已禁用");
-            }
+            if (valueCounts.empty()) return mostCommon;
+
+            int maxCount = 0;
             for (const auto& pair : valueCounts) {
-                if (pair.second > mostCommon.second && pair.first != L"已禁用") {
+                if (pair.second > maxCount) {
+                    maxCount = pair.second;
                     mostCommon = pair;
                 }
             }
+            
+            int otherValuesCount = 0;
+            for (const auto& pair : valueCounts) {
+                if (pair.first != mostCommon.first) {
+                    otherValuesCount++;
+                }
+            }
+            if (otherValuesCount > 0) {
+                 mostCommon.first = L"混合值";
+            }
+
             return mostCommon;
         };
 
@@ -303,13 +388,10 @@ public:
         for (HANDLE hJob : g_hJobs) {
             JOBOBJECT_BASIC_LIMIT_INFORMATION info = {};
             QueryInformationJobObject(hJob, JobObjectBasicLimitInformation, &info, sizeof(info), NULL);
-            if (info.LimitFlags & JOB_OBJECT_LIMIT_AFFINITY) {
-                std::wstringstream wss; wss << L"0x" << std::hex << std::uppercase << info.Affinity;
-                counts[wss.str()]++;
-            } else { counts[L"已禁用"]++; }
+            counts[MaskToAffinityString(info.Affinity)]++;
         }
         auto commonAffinity = findMostCommon(counts);
-        PrintStatusLine(L"1. 亲和性 (Affinity)", commonAffinity.first, commonAffinity.second, g_hJobs.size() - commonAffinity.second);
+        PrintStatusLine(L"1. 亲和性 (Affinity)", commonAffinity.first, counts[commonAffinity.first], g_hJobs.size() - counts[commonAffinity.first]);
 
         // 2. Priority
         counts.clear();
@@ -331,7 +413,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonPriority = findMostCommon(counts);
-        PrintStatusLine(L"2. 优先级 (Priority)", commonPriority.first, commonPriority.second, g_hJobs.size() - commonPriority.second);
+        PrintStatusLine(L"2. 优先级 (Priority)", commonPriority.first, counts[commonPriority.first], g_hJobs.size() - counts[commonPriority.first]);
 
         // 3. Scheduling
         counts.clear();
@@ -343,7 +425,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonScheduling = findMostCommon(counts);
-        PrintStatusLine(L"3. 调度优先级 (Scheduling)", commonScheduling.first, commonScheduling.second, g_hJobs.size() - commonScheduling.second);
+        PrintStatusLine(L"3. 调度优先级 (Scheduling)", commonScheduling.first, counts[commonScheduling.first], g_hJobs.size() - counts[commonScheduling.first]);
 
         // 4. Weight
         counts.clear();
@@ -355,7 +437,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonWeight = findMostCommon(counts);
-        PrintStatusLine(L"4. 时间片权重 (Weight)", commonWeight.first, commonWeight.second, g_hJobs.size() - commonWeight.second);
+        PrintStatusLine(L"4. 时间片权重 (Weight)", commonWeight.first, counts[commonWeight.first], g_hJobs.size() - counts[commonWeight.first]);
 
         // 5. DSCP
         counts.clear();
@@ -367,7 +449,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonDscp = findMostCommon(counts);
-        PrintStatusLine(L"5. 数据包优先级 (DSCP)", commonDscp.first, commonDscp.second, g_hJobs.size() - commonDscp.second);
+        PrintStatusLine(L"5. 数据包优先级 (DSCP)", commonDscp.first, counts[commonDscp.first], g_hJobs.size() - counts[commonDscp.first]);
 
         // 6. CpuLimit
         counts.clear();
@@ -379,7 +461,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonCpuLimit = findMostCommon(counts);
-        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", commonCpuLimit.first, commonCpuLimit.second, g_hJobs.size() - commonCpuLimit.second);
+        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", commonCpuLimit.first, counts[commonCpuLimit.first], g_hJobs.size() - counts[commonCpuLimit.first]);
 
         // 8. WorkingSet
         counts.clear();
@@ -391,7 +473,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonWorkingSet = findMostCommon(counts);
-        PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", commonWorkingSet.first, commonWorkingSet.second, g_hJobs.size() - commonWorkingSet.second);
+        PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", commonWorkingSet.first, counts[commonWorkingSet.first], g_hJobs.size() - counts[commonWorkingSet.first]);
         
         SafeWriteConsole(L"----------------------------------------------------\n");
     }
@@ -409,6 +491,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         if (AllocConsole()) {
             g_ConsoleAttached = true;
         }
+    }
+
+    // FIX: Enable Virtual Terminal Processing for RGB colors
+    if (g_ConsoleAttached) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD dwMode = 0;
+        GetConsoleMode(hOut, &dwMode);
+        dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        SetConsoleMode(hOut, dwMode);
     }
 
     EnableAllPrivileges();
@@ -429,7 +520,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     LocalFree(argv);
 
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");
+        LogColor(0, L"错误: 无法设置 Ctrl+C 处理器。\n");
     }
 
     std::vector<DWORD> pids;
@@ -439,7 +530,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         } else if (args.count(L"processid")) {
             try { pids.push_back(std::stoi(args[L"processid"])); } catch(...) {}
         } else {
-            LogColor(COLOR_ERROR, L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
+            LogColor(0, L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
             return 1;
         }
     } else {
@@ -455,21 +546,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
-            if (pids.empty()) LogColor(COLOR_ERROR, L"未找到任何目标进程, 请重试。\n");
+            if (pids.empty()) LogColor(0, L"未找到任何目标进程, 请重试。\n");
         }
     }
 
     if (pids.empty()) {
-        LogColor(COLOR_ERROR, L"未找到任何目标进程, 脚本将退出。\n");
+        LogColor(0, L"未找到任何目标进程, 脚本将退出。\n");
         return 1;
     }
-    LogColor(COLOR_INFO, L"已找到 %zu 个目标进程。\n", pids.size());
+    LogColor(0, L"已找到 %zu 个目标进程。\n", pids.size());
     
-    LogColor(COLOR_INFO, L"为每个进程创建唯一的作业对象并分配...\n");
+    LogColor(0, L"为每个进程创建唯一的作业对象并分配...\n");
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
         if (!hProcess) {
-            LogColor(COLOR_ERROR, L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError());
+            LogColor(0, L"  -> 打开 PID %lu 失败 (错误码: %lu)\n", pid, GetLastError());
             continue;
         }
 
@@ -483,26 +574,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
         if (hJob) {
             if (AssignProcessToJobObject(hJob, hProcess)) {
-                LogColor(COLOR_SUCCESS, L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
+                LogColor(0, L"  -> 成功将 PID %lu (%s) 分配到作业 '%s'\n", pid, processName, jobName.c_str());
                 g_hJobs.push_back(hJob);
             } else {
-                LogColor(COLOR_ERROR, L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
+                LogColor(0, L"  -> 分配 PID %lu 到作业失败 (错误码: %lu)\n", pid, GetLastError());
                 CloseHandle(hJob);
             }
         } else {
-            LogColor(COLOR_ERROR, L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
+            LogColor(0, L"  -> 创建作业 '%s' 失败 (错误码: %lu)\n", jobName.c_str(), GetLastError());
         }
         CloseHandle(hProcess);
     }
 
     if (g_hJobs.empty()) {
-        LogColor(COLOR_ERROR, L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
+        LogColor(0, L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
         return 1;
     }
 
     if (isOneShotMode) {
-        LogColor(COLOR_INFO, L"----------------------------------------------------\n");
-        LogColor(COLOR_INFO, L"正在应用一次性设置到 %zu 个作业对象...\n", g_hJobs.size());
+        LogColor(0, L"----------------------------------------------------\n");
+        LogColor(0, L"正在应用一次性设置到 %zu 个作业对象...\n", g_hJobs.size());
         DWORD_PTR affinity = 0;
         int priority = -1, scheduling = -1, weight = -1, dscp = -1, cpuLimit = -1;
         std::pair<size_t, size_t> workingSet = {0, 0};
@@ -526,7 +617,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         int s, f;
         JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet, s, f);
         
-        LogColor(COLOR_SUCCESS, L"所有操作完成。脚本将退出，限制将持续有效。\n");
+        LogColor(0, L"所有操作完成。脚本将退出，限制将持续有效。\n");
         CleanupAndExit();
         if (g_ConsoleAttached) { FreeConsole(); }
         exit(0);
@@ -538,13 +629,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         while (true) {
             JobController::DisplayAggregatedStatus();
-            SafeWriteConsole(L"请选择要修改的功能 (1-8), 或输入 'exit' 退出: ");
+            SafeWriteConsole(L"请选择要修改的功能 (0-8), 或输入 'exit' 退出: ");
             std::wstring choice = SafeReadConsole();
             bool settingChanged = true;
 
-            if (choice == L"-1") {
+            if (choice == L"0") {
                 ClearAllJobSettings();
-                LogColor(COLOR_SUCCESS, L"所有限制已成功禁用！\n");
             } else if (choice == L"1") {
                 SafeWriteConsole(L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ");
                 std::wstring input = SafeReadConsole();
@@ -587,8 +677,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             
             if (settingChanged) {
                 int successCount, failCount;
-                JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet, successCount, failCount);
-                LogColor(COLOR_INFO, L"应用结果 -> 成功: %d, 失败: %d\n", successCount, failCount);
+                if (choice == L"0") {
+                    // ClearAllJobSettings doesn't return status, so we assume success
+                    successCount = g_hJobs.size();
+                    failCount = 0;
+                } else {
+                    JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, workingSet, successCount, failCount);
+                }
+                
+                SafeWriteConsole(L"应用结果 -> ");
+                SetConsoleColorRGB(COLOR_SUCCESS_R, COLOR_SUCCESS_G, COLOR_SUCCESS_B);
+                SafeWriteConsole(L"成功: " + std::to_wstring(successCount));
+                ResetConsoleColor();
+                SafeWriteConsole(L", ");
+                SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
+                SafeWriteConsole(L"失败: " + std::to_wstring(failCount) + L"\n");
+                ResetConsoleColor();
             }
             
             SafeWriteConsole(L"按回车键继续...");

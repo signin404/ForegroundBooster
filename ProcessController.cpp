@@ -13,11 +13,13 @@
 #include <io.h>
 #include <fcntl.h>
 #include <tlhelp32.h>
+#include <shellapi.h> // Header for CommandLineToArgvW
 
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib") // --- FIX: Added the missing library for CommandLineToArgvW ---
 
 #if (NTDDI_VERSION < NTDDI_WIN10_RS1)
 #ifndef JOB_OBJECT_NET_RATE_CONTROL_ENABLE
@@ -103,7 +105,6 @@ void PrintStatusLine(const std::wstring& label, const std::wstring& value) {
     SetConsoleTextAttribute(hConsole, COLOR_DEFAULT);
 }
 
-// --- FIX: Use wstringstream to avoid unsafe type conversion ---
 bool ParseAffinityString(std::wstring w_s, DWORD_PTR& mask) {
     std::replace(w_s.begin(), w_s.end(), L' ', L',');
     mask = 0;
@@ -273,7 +274,6 @@ void RedirectIOToConsole() {
     _setmode(_fileno(stderr), _O_U16TEXT);
 }
 
-// --- FIX: Change entry point to wWinMain for /SUBSYSTEM:WINDOWS ---
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
@@ -291,7 +291,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     EnableAllPrivileges();
     
-    // --- FIX: Manual command-line parsing for wWinMain ---
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;
@@ -305,7 +304,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             args[arg] = argv[++i];
         }
     }
-    LocalFree(argv); // Free memory allocated by CommandLineToArgvW
+    LocalFree(argv);
 
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LogColor(COLOR_ERROR, L"错误: 无法设置 Ctrl+C 处理器。\n");

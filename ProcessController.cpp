@@ -261,24 +261,35 @@ private:
     HANDLE m_hJob;
 };
 
+// --- FIX: This function is the key to correctly re-associating I/O streams ---
+void RedirectIOToConsole() {
+    FILE* f_out, *f_in, *f_err;
+    freopen_s(&f_out, "CONOUT$", "w", stdout);
+    freopen_s(&f_err, "CONOUT$", "w", stderr);
+    freopen_s(&f_in, "CONIN$", "r", stdin);
+
+    std::wcout.clear();
+    std::wcin.clear();
+    std::wcerr.clear();
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
     bool isOneShotMode = wcslen(pCmdLine) > 0;
 
-    // --- FIX: Simplified and corrected console setup ---
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         g_ConsoleAttached = true;
-        // We attached to an existing console, set its mode to Unicode
+        RedirectIOToConsole();
+    } else if (!isOneShotMode) {
+        if (AllocConsole()) {
+            g_ConsoleAttached = true;
+            RedirectIOToConsole();
+        }
+    }
+    
+    if (g_ConsoleAttached) {
         _setmode(_fileno(stdout), _O_U16TEXT);
         _setmode(_fileno(stdin),  _O_U16TEXT);
         _setmode(_fileno(stderr), _O_U16TEXT);
-    } else if (!isOneShotMode) {
-        // Only create a new console if we are in interactive mode
-        if (AllocConsole()) {
-            g_ConsoleAttached = true;
-            _setmode(_fileno(stdout), _O_U16TEXT);
-            _setmode(_fileno(stdin),  _O_U16TEXT);
-            _setmode(_fileno(stderr), _O_U16TEXT);
-        }
     }
 
     EnableAllPrivileges();
@@ -489,7 +500,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CleanupAndExit();
     }
 
-    // --- FIX: Detach from the console before exiting ---
     if (g_ConsoleAttached) {
         FreeConsole();
     }

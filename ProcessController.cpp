@@ -340,6 +340,9 @@ public:
         if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
             overallSuccess = false;
         }
+        
+        return overallSuccess;
+    }
 
     static void DisplayAggregatedStatus() {
         if (g_hJobs.empty()) return;

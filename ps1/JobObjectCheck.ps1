@@ -121,13 +121,13 @@ $jobObjectName = ""
 $processNameInput = Read-Host -Prompt "请输入目标进程名 (不包含.exe), 或留空以输入进程ID"
 
 if (-not [string]::IsNullOrWhiteSpace($processNameInput)) {
-    $jobObjectName = "Global\ProcessControllerJob_Name_$($processNameInput)"
+    $jobObjectName = "Global\ProcessControllerJob_$($processNameInput).exe_$($processId)"
 } else {
     $processIdInput = Read-Host -Prompt "请输入目标进程ID"
     if (-not [string]::IsNullOrWhiteSpace($processIdInput)) {
         try {
             $processId = [int]$processIdInput
-            $jobObjectName = "Global\ForegroundBoosterJob_PID_$($processId)"
+            $jobObjectName = "Global\ProcessControllerJob_Enable.exe_$($processId)"
         } catch {
             Write-Warning "无效的进程ID"
         }

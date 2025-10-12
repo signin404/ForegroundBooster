@@ -137,7 +137,7 @@ void EnableAllPrivileges() {
 void PrintStatusLine(const std::wstring& label, const std::wstring& value, int successCount = -1, int failCount = -1) {
     SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
     SafeWriteConsole(label + L": "); // 直接打印 label
-    
+
     if (value == L"已禁用" || value == L"混合值") {
         SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
     } else {
@@ -155,7 +155,7 @@ void PrintStatusLine(const std::wstring& label, const std::wstring& value, int s
         SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
         SafeWriteConsole(L"失败:" + std::to_wstring(failCount));
     }
-    
+
     ResetConsoleColor();
     SafeWriteConsole(L"\n");
 }
@@ -282,7 +282,7 @@ public:
     static bool ApplySettingsToSingle(HANDLE m_hJob, DWORD_PTR affinity, int priority, int scheduling, int weight, int dscp, int cpuLimit, int netLimit, const std::pair<size_t, size_t>& workingSet) {
         bool overallSuccess = true;
 
-        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {}; 
+        JOBOBJECT_BASIC_LIMIT_INFORMATION basicInfo = {};
         if (affinity != 0) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_AFFINITY; basicInfo.Affinity = affinity; }
         if (priority != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS; basicInfo.PriorityClass = priority; }
         if (scheduling != -1) { basicInfo.LimitFlags |= JOB_OBJECT_LIMIT_SCHEDULING_CLASS; basicInfo.SchedulingClass = scheduling; }
@@ -336,7 +336,7 @@ public:
         if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
             overallSuccess = false;
         }
-        
+
         return overallSuccess;
     }
 
@@ -355,7 +355,7 @@ public:
         SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
         SafeWriteConsole(L"--- 进程控制器菜单 ---\n");
         ResetConsoleColor();
-        
+
         SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
         std::wstring disableLabel = L"0. 禁用所有限制";
         for (size_t i = disableLabel.length(); i < 27; ++i) disableLabel += L" ";
@@ -363,7 +363,7 @@ public:
         ResetConsoleColor();
 
         std::map<std::wstring, int> counts;
-        
+
         auto findMostCommon = [&](const std::map<std::wstring, int>& valueCounts) {
             std::pair<std::wstring, int> mostCommon = {L"已禁用", 0};
             if (valueCounts.empty()) return mostCommon;
@@ -375,7 +375,7 @@ public:
                     mostCommon = pair;
                 }
             }
-            
+
             if (valueCounts.size() > 1) {
                  mostCommon.first = L"混合值";
             }
@@ -490,7 +490,7 @@ public:
         }
         auto commonWorkingSet = findMostCommon(counts);
         PrintStatusLine(L"8. 物理内存限制 (WorkingSet) ", commonWorkingSet.first, counts[commonWorkingSet.first], static_cast<int>(g_hJobs.size()) - counts[commonWorkingSet.first]);
-        
+
         SafeWriteConsole(L"----------------------------------------------------\n");
     }
 };
@@ -506,12 +506,12 @@ void DisplayHelp() {
             SetConsoleMode(hOut, dwMode);
         }
     }
-    
+
     SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
     SafeWriteConsole(L"\nProcessController - 命令行参数帮助\n\n");
     ResetConsoleColor();
     SafeWriteConsole(L"用法: ProcessController.exe [参数] [值] ...\n\n");
-    
+
     auto print_param = [](const std::wstring& param, const std::wstring& desc) {
         SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
         std::wstring paddedParam = param;
@@ -531,7 +531,8 @@ void DisplayHelp() {
     print_param(L"-CpuLimit", L"CPU使用率限制 (1-100) 与Weight互斥");
     print_param(L"-NetLimit", L"传出带宽限制 (单位: KB/s)");
     print_param(L"-Working", L"物理内存限制 (格式: 最小MB-最大MB)");
-    
+	print_param(L"-Wait", L"保持运行");
+
     SafeWriteConsole(L"\n示例:\n");
     SafeWriteConsole(L"ProcessController.exe -ProcessName Game.exe -Affinity 8,10,12-15 -Priority High -Scheduling 9 -Weight 9 -DSCP 46\n");
 }
@@ -557,7 +558,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    
+
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;
@@ -571,7 +572,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
         // [新增] 添加对 -wait 标志参数的处理
         if (arg == L"-wait") {
-            args[L"wait"] = L""; // 它的存在即是意义，值不重要
+            args[L"wait"] = L""; // 它的存在即是意义 值不重要
             continue;
         }
         if (arg.rfind(L'-', 0) == 0 && i + 1 < argc) {
@@ -625,7 +626,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 1;
     }
     LogColor(L"已找到 %zu 个目标进程\n", pids.size());
-    
+
     LogColor(L"为每个进程创建唯一的作业对象并分配...\n");
     for (DWORD pid : pids) {
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid);
@@ -640,7 +641,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         std::wstring jobName = L"Global\\ProcessControllerJob_" + std::wstring(processName) + L"_" + std::to_wstring(pid);
-        
+
         HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
         if (hJob) {
             if (AssignProcessToJobObject(hJob, hProcess)) {
@@ -684,19 +685,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             size_t dash_pos = ws_str.find(L'-');
             if (dash_pos != std::wstring::npos) { try { workingSet.first = std::stoul(ws_str.substr(0, dash_pos)); workingSet.second = std::stoul(ws_str.substr(dash_pos + 1)); } catch(...) {} }
         }
-        
+
         int s, f;
         JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
-        
+
         LogColor(L"所有操作完成\n");
 
         // [新增] 检查是否存在 -wait 参数
         if (args.count(L"wait")) {
             LogColor(L"程序将保持运行以维持作业对象句柄\n");
-            // 进入无限循环，等待用户手动终止 (Ctrl+C)
+            // 进入无限循环 等待用户手动终止 (Ctrl+C)
             // CtrlHandler 会负责调用 CleanupAndExit
             while (true) {
-                Sleep(10000); 
+                Sleep(10000);
             }
         } else {
             LogColor(L"程序将退出 限制将持续有效\n");
@@ -711,10 +712,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         while (true) {
             JobController::DisplayAggregatedStatus();
-            SafeWriteConsole(L"请选择要修改的功能 (0-8): ");
+            SafeWriteConsole(L"请选择要应用的限制 (0-8): ");
             std::wstring choice = SafeReadConsole();
             bool settingChanged = true;
-            
+
             if (choice == L"0") {
                 ClearAllJobSettings();
                 affinity = 0;
@@ -770,7 +771,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 SafeReadConsole();
                 settingChanged = false;
             }
-            
+
             if (settingChanged) {
                 int s, f;
                 JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);

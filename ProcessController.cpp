@@ -136,9 +136,7 @@ void EnableAllPrivileges() {
 
 void PrintStatusLine(const std::wstring& label, const std::wstring& value, int successCount = -1, int failCount = -1) {
     SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
-    std::wstring paddedLabel = label;
-    for (size_t i = label.length(); i < 32; ++i) paddedLabel += L" ";
-    SafeWriteConsole(paddedLabel + L": ");
+    SafeWriteConsole(label + L": "); // 直接打印 label
     
     if (value == L"已禁用" || value == L"混合值") {
         SetConsoleColorRGB(COLOR_DISABLED_R, COLOR_DISABLED_G, COLOR_DISABLED_B);
@@ -397,7 +395,7 @@ public:
             }
         }
         auto commonAffinity = findMostCommon(counts);
-        PrintStatusLine(L"1. 亲和性 (Affinity)", commonAffinity.first, counts[commonAffinity.first], static_cast<int>(g_hJobs.size()) - counts[commonAffinity.first]);
+        PrintStatusLine(L"1. 亲和性 (Affinity)         ", commonAffinity.first, counts[commonAffinity.first], static_cast<int>(g_hJobs.size()) - counts[commonAffinity.first]);
 
         // 2. Priority
         counts.clear();
@@ -419,7 +417,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonPriority = findMostCommon(counts);
-        PrintStatusLine(L"2. 优先级 (Priority)", commonPriority.first, counts[commonPriority.first], static_cast<int>(g_hJobs.size()) - counts[commonPriority.first]);
+        PrintStatusLine(L"2. 优先级 (Priority)         ", commonPriority.first, counts[commonPriority.first], static_cast<int>(g_hJobs.size()) - counts[commonPriority.first]);
 
         // 3. Scheduling
         counts.clear();
@@ -431,7 +429,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonScheduling = findMostCommon(counts);
-        PrintStatusLine(L"3. 调度优先级 (Scheduling)", commonScheduling.first, counts[commonScheduling.first], static_cast<int>(g_hJobs.size()) - counts[commonScheduling.first]);
+        PrintStatusLine(L"3. 调度优先级 (Scheduling)   ", commonScheduling.first, counts[commonScheduling.first], static_cast<int>(g_hJobs.size()) - counts[commonScheduling.first]);
 
         // 4. Weight
         counts.clear();
@@ -443,7 +441,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonWeight = findMostCommon(counts);
-        PrintStatusLine(L"4. 时间片权重 (Weight)", commonWeight.first, counts[commonWeight.first], static_cast<int>(g_hJobs.size()) - counts[commonWeight.first]);
+        PrintStatusLine(L"4. 时间片权重 (Weight)       ", commonWeight.first, counts[commonWeight.first], static_cast<int>(g_hJobs.size()) - counts[commonWeight.first]);
 
         // 5. DSCP
         counts.clear();
@@ -455,7 +453,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonDscp = findMostCommon(counts);
-        PrintStatusLine(L"5. 数据包优先级 (DSCP)", commonDscp.first, counts[commonDscp.first], static_cast<int>(g_hJobs.size()) - counts[commonDscp.first]);
+        PrintStatusLine(L"5. 数据包优先级 (DSCP)       ", commonDscp.first, counts[commonDscp.first], static_cast<int>(g_hJobs.size()) - counts[commonDscp.first]);
 
         // 6. CpuLimit
         counts.clear();
@@ -467,7 +465,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonCpuLimit = findMostCommon(counts);
-        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)", commonCpuLimit.first, counts[commonCpuLimit.first], static_cast<int>(g_hJobs.size()) - counts[commonCpuLimit.first]);
+        PrintStatusLine(L"6. CPU使用率限制 (CpuLimit)  ", commonCpuLimit.first, counts[commonCpuLimit.first], static_cast<int>(g_hJobs.size()) - counts[commonCpuLimit.first]);
 
         // 7. NetLimit
         counts.clear();
@@ -479,7 +477,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonNetLimit = findMostCommon(counts);
-        PrintStatusLine(L"7. 传出带宽限制 (NetLimit)", commonNetLimit.first, counts[commonNetLimit.first], static_cast<int>(g_hJobs.size()) - counts[commonNetLimit.first]);
+        PrintStatusLine(L"7. 传出带宽限制 (NetLimit)   ", commonNetLimit.first, counts[commonNetLimit.first], static_cast<int>(g_hJobs.size()) - counts[commonNetLimit.first]);
 
         // 8. WorkingSet
         counts.clear();
@@ -491,7 +489,7 @@ public:
             } else { counts[L"已禁用"]++; }
         }
         auto commonWorkingSet = findMostCommon(counts);
-        PrintStatusLine(L"8. 物理内存限制 (WorkingSet)", commonWorkingSet.first, counts[commonWorkingSet.first], static_cast<int>(g_hJobs.size()) - counts[commonWorkingSet.first]);
+        PrintStatusLine(L"8. 物理内存限制 (WorkingSet) ", commonWorkingSet.first, counts[commonWorkingSet.first], static_cast<int>(g_hJobs.size()) - counts[commonWorkingSet.first]);
         
         SafeWriteConsole(L"----------------------------------------------------\n");
     }
@@ -571,6 +569,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             args[L"?"] = L"";
             continue;
         }
+        // [新增] 添加对 -wait 标志参数的处理
+        if (arg == L"-wait") {
+            args[L"wait"] = L""; // 它的存在即是意义，值不重要
+            continue;
+        }
         if (arg.rfind(L'-', 0) == 0 && i + 1 < argc) {
             arg.erase(0, 1);
             std::transform(arg.begin(), arg.end(), arg.begin(), ::towlower);
@@ -618,7 +621,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     if (pids.empty()) {
-        LogColor(L"未找到任何目标进程 脚本将退出\n");
+        LogColor(L"未找到任何目标进程 程序将退出\n");
         return 1;
     }
     LogColor(L"已找到 %zu 个目标进程\n", pids.size());
@@ -654,7 +657,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     if (g_hJobs.empty()) {
-        LogColor(L"未能成功创建并分配任何作业对象 脚本将退出\n");
+        LogColor(L"未能成功创建并分配任何作业对象 程序将退出\n");
         return 1;
     }
 
@@ -685,10 +688,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         int s, f;
         JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
         
-        LogColor(L"所有操作完成 脚本将退出 限制将持续有效\n");
-        // CleanupAndExit();
-        if (g_ConsoleAttached) { FreeConsole(); }
-        exit(0);
+        LogColor(L"所有操作完成\n");
+
+        // [新增] 检查是否存在 -wait 参数
+        if (args.count(L"wait")) {
+            LogColor(L"程序将保持运行以维持作业对象句柄\n");
+            // 进入无限循环，等待用户手动终止 (Ctrl+C)
+            // CtrlHandler 会负责调用 CleanupAndExit
+            while (true) {
+                Sleep(10000); 
+            }
+        } else {
+            LogColor(L"程序将退出 限制将持续有效\n");
+            if (g_ConsoleAttached) { FreeConsole(); }
+            exit(0);
+        }
 
     } else {
         DWORD_PTR affinity = 0;

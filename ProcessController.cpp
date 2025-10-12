@@ -1,5 +1,3 @@
-// ProcessController.cpp
-
 #include <iostream>
 #include <string>
 #include <vector>
@@ -139,7 +137,7 @@ void EnableAllPrivileges() {
 void PrintStatusLine(const std::wstring& label, const std::wstring& value, int successCount = -1, int failCount = -1) {
     SetConsoleColorRGB(COLOR_LABEL_R, COLOR_LABEL_G, COLOR_LABEL_B);
     std::wstring paddedLabel = label;
-    for (size_t i = label.length(); i < 25; ++i) paddedLabel += L" ";
+    for (size_t i = label.length(); i < 32; ++i) paddedLabel += L" ";
     SafeWriteConsole(paddedLabel + L": ");
     
     if (value == L"已禁用" || value == L"混合值") {
@@ -247,7 +245,7 @@ void ClearAllJobSettings() {
 void CleanupAndExit() {
     if (!g_hJobs.empty()) {
         SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
-        SafeWriteConsole(L"\n正在退出... 限制将保持生效。\n");
+        SafeWriteConsole(L"\n正在退出... 限制将保持生效\n");
         ResetConsoleColor();
         for (HANDLE hJob : g_hJobs) {
             CloseHandle(hJob);
@@ -313,30 +311,30 @@ public:
 
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION resetInfo = {}; // ControlFlags 和所有成员都为 0
         SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &resetInfo, sizeof(resetInfo));
-        // 我们暂时忽略此调用的返回值，因为最终决定成功与否的是下面的第二次调用。
+        // 我们暂时忽略此调用的返回值 因为最终决定成功与否的是下面的第二次调用
 
-        // 步骤 2: 根据主循环中保存的当前期望状态，从零开始构建最终的配置。
+        // 步骤 2: 根据主循环中保存的当前期望状态 从零开始构建最终的配置
         JOBOBJECT_NET_RATE_CONTROL_INFORMATION netInfo = {};
 
-        // 如果 netLimit 不是 -1，则将其配置添加到最终设置中。
+        // 如果 netLimit 不是 -1 则将其配置添加到最终设置中
         if (netLimit != -1) {
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_MAX_BANDWIDTH;
             netInfo.MaxBandwidth = static_cast<DWORD64>(netLimit) * 1024;
         }
 
-        // 如果 dscp 不是 -1，则将其配置添加到最终设置中。
+        // 如果 dscp 不是 -1 则将其配置添加到最终设置中
         if (dscp != -1) {
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_DSCP_TAG;
             netInfo.DscpTag = (BYTE)dscp;
         }
 
-        // 只有当需要启用至少一个功能时，才添加总的启用开关。
+        // 只有当需要启用至少一个功能时 才添加总的启用开关
         if (netInfo.ControlFlags != 0) {
             netInfo.ControlFlags |= JOB_OBJECT_NET_RATE_CONTROL_ENABLE;
         }
 
-        // 步骤 3: 将最终构建好的配置应用到已被重置的作业对象上。
-        // 整个操作的成功与否取决于这次调用的结果。
+        // 步骤 3: 将最终构建好的配置应用到已被重置的作业对象上
+        // 整个操作的成功与否取决于这次调用的结果
         if (!SetInformationJobObject(m_hJob, JobObjectNetRateControlInformation, &netInfo, sizeof(netInfo))) {
             overallSuccess = false;
         }
@@ -512,7 +510,7 @@ void DisplayHelp() {
     }
     
     SetConsoleColorRGB(COLOR_ENABLED_R, COLOR_ENABLED_G, COLOR_ENABLED_B);
-    SafeWriteConsole(L"ProcessController - 命令行参数帮助\n\n");
+    SafeWriteConsole(L"\nProcessController - 命令行参数帮助\n\n");
     ResetConsoleColor();
     SafeWriteConsole(L"用法: ProcessController.exe [参数] [值] ...\n\n");
     
@@ -525,19 +523,19 @@ void DisplayHelp() {
         SafeWriteConsole(L"| " + desc + L"\n");
     };
 
-    print_param(L"-ProcessName", L"目标进程的名称 (例如: chrome.exe)");
-    print_param(L"-ProcessId", L"目标进程的ID (例如: 1234)");
-    print_param(L"-Affinity", L"设置CPU亲和性 (例如: \"0 1 2\" 或 \"4-7\")");
-    print_param(L"-Priority", L"设置优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime)");
-    print_param(L"-Scheduling", L"设置调度优先级 (0-9)");
-    print_param(L"-Weight", L"设置时间片权重 (1-9), 与CpuLimit互斥");
-    print_param(L"-DSCP", L"设置网络数据包优先级 (0-63)");
-    print_param(L"-CpuLimit", L"设置CPU使用率上限 (1-100), 与Weight互斥");
-    print_param(L"-NetLimit", L"设置传出带宽上限 (单位: KB/s)");
-    print_param(L"-Working", L"设置物理内存限制 (格式: \"最小MB-最大MB\", 例如: \"10-100\")");
+    print_param(L"-ProcessName", L"进程名称 (例如: chrome.exe)");
+    print_param(L"-ProcessId", L"进程ID (例如: 1234)");
+    print_param(L"-Affinity", L"亲和性 (例如: 8,10,12-15 或 \"8 10 12-15\")");
+    print_param(L"-Priority", L"优先级 (Idle | BelowNormal | Normal | AboveNormal | High | RealTime)");
+    print_param(L"-Scheduling", L"调度优先级 (0-9)");
+    print_param(L"-Weight", L"时间片权重 (1-9) 与CpuLimit互斥");
+    print_param(L"-DSCP", L"数据包优先级 (0-63)");
+    print_param(L"-CpuLimit", L"CPU使用率限制 (1-100) 与Weight互斥");
+    print_param(L"-NetLimit", L"传出带宽限制 (单位: KB/s)");
+    print_param(L"-Working", L"物理内存限制 (格式: 最小MB-最大MB)");
     
     SafeWriteConsole(L"\n示例:\n");
-    SafeWriteConsole(L"  ProcessController.exe -ProcessName \"game.exe\" -Affinity \"4-7\" -Priority High\n");
+    SafeWriteConsole(L"ProcessController.exe -ProcessName Game.exe -Affinity 8,10,12-15 -Priority High -Scheduling 9 -Weight 9 -DSCP 46\n");
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
@@ -589,7 +587,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     EnableAllPrivileges();
 
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
-        LogColor(L"错误: 无法设置 Ctrl+C 处理器。\n");
+        LogColor(L"错误: 无法设置 Ctrl+C 处理器\n");
     }
 
     std::vector<DWORD> pids;
@@ -599,12 +597,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         } else if (args.count(L"processid")) {
             try { pids.push_back(std::stoi(args[L"processid"])); } catch(...) {}
         } else {
-            LogColor(L"错误: 在一次性模式下, 必须提供 -ProcessName 或 -ProcessId 参数。\n");
+            LogColor(L"错误: 在一次性模式下 必须提供 -ProcessName 或 -ProcessId 参数\n");
             return 1;
         }
     } else {
         while (pids.empty()) {
-            SafeWriteConsole(L"请输入目标进程名 (例如: chrome), 或留空以输入进程ID: ");
+            SafeWriteConsole(L"请输入目标进程名: ");
             std::wstring name_input = SafeReadConsole();
             if (!name_input.empty()) {
                 pids = FindProcessByName(name_input);
@@ -615,15 +613,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                     if(!id_input.empty()) pids.push_back(std::stoi(id_input));
                 } catch(...) {}
             }
-            if (pids.empty()) LogColor(L"未找到任何目标进程, 请重试。\n");
+            if (pids.empty()) LogColor(L"未找到任何目标进程 请重试\n");
         }
     }
 
     if (pids.empty()) {
-        LogColor(L"未找到任何目标进程, 脚本将退出。\n");
+        LogColor(L"未找到任何目标进程 脚本将退出\n");
         return 1;
     }
-    LogColor(L"已找到 %zu 个目标进程。\n", pids.size());
+    LogColor(L"已找到 %zu 个目标进程\n", pids.size());
     
     LogColor(L"为每个进程创建唯一的作业对象并分配...\n");
     for (DWORD pid : pids) {
@@ -656,7 +654,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     if (g_hJobs.empty()) {
-        LogColor(L"未能成功创建并分配任何作业对象, 脚本将退出。\n");
+        LogColor(L"未能成功创建并分配任何作业对象 脚本将退出\n");
         return 1;
     }
 
@@ -687,8 +685,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         int s, f;
         JobController::ApplySettingsToAll(affinity, priority, scheduling, weight, dscp, cpuLimit, netLimit, workingSet, s, f);
         
-        LogColor(L"所有操作完成。脚本将退出，限制将持续有效。\n");
-        CleanupAndExit();
+        LogColor(L"所有操作完成 脚本将退出 限制将持续有效\n");
+        // CleanupAndExit();
         if (g_ConsoleAttached) { FreeConsole(); }
         exit(0);
 
@@ -699,7 +697,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
         while (true) {
             JobController::DisplayAggregatedStatus();
-            SafeWriteConsole(L"请选择要修改的功能 (0-8), 或输入 'exit' 退出: ");
+            SafeWriteConsole(L"请选择要修改的功能 (0-8): ");
             std::wstring choice = SafeReadConsole();
             bool settingChanged = true;
             
@@ -714,36 +712,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
                 netLimit = -1;
                 workingSet = {0, 0};
             } else if (choice == L"1") {
-                SafeWriteConsole(L"新亲和性 (例: 8 10 12-15) 或 -1 禁用: ");
+                SafeWriteConsole(L"(例如: 8 10 12-15) 或 -1 禁用\n亲和性: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") affinity = 0; else ParseAffinityString(input, affinity);
             } else if (choice == L"2") {
-                SafeWriteConsole(L"新优先级 (Idle, BelowNormal, Normal, AboveNormal, High, RealTime) 或 -1 禁用: ");
+                SafeWriteConsole(L"(Idle | BelowNormal | Normal | AboveNormal | High | RealTime) 或 -1 禁用\n优先级: ");
                 std::wstring w_input = SafeReadConsole();
                 std::transform(w_input.begin(), w_input.end(), w_input.begin(), ::towlower);
                 if (w_input == L"-1") priority = -1; else if (w_input == L"idle") priority = IDLE_PRIORITY_CLASS; else if (w_input == L"belownormal") priority = BELOW_NORMAL_PRIORITY_CLASS; else if (w_input == L"normal") priority = NORMAL_PRIORITY_CLASS; else if (w_input == L"abovenormal") priority = ABOVE_NORMAL_PRIORITY_CLASS; else if (w_input == L"high") priority = HIGH_PRIORITY_CLASS; else if (w_input == L"realtime") priority = REALTIME_PRIORITY_CLASS;
             } else if (choice == L"3") {
-                SafeWriteConsole(L"新调度优先级 (0-9) 或 -1 禁用: ");
+                SafeWriteConsole(L"(0-9) 或 -1 禁用\n调度优先级: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") scheduling = -1; else try { scheduling = std::stoi(input); } catch(...) {}
             } else if (choice == L"4") {
-                SafeWriteConsole(L"新时间片权重 (1-9) 或 -1 禁用: ");
+                SafeWriteConsole(L"(1-9) 或 -1 禁用\n时间片权重: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") weight = -1; else try { weight = std::stoi(input); cpuLimit = -1; } catch(...) {}
             } else if (choice == L"5") {
-                SafeWriteConsole(L"新数据包优先级 (0-63) 或 -1 禁用: ");
+                SafeWriteConsole(L"(0-63) 或 -1 禁用\n数据包优先级: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") dscp = -1; else try { dscp = std::stoi(input); } catch(...) {}
             } else if (choice == L"6") {
-                SafeWriteConsole(L"新CPU使用率上限 (1-100) 或 -1 禁用: ");
+                SafeWriteConsole(L"(1-100) 或 -1 禁用\nCPU使用率限制: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") cpuLimit = -1; else try { cpuLimit = std::stoi(input); weight = -1; } catch(...) {}
             } else if (choice == L"7") {
-                SafeWriteConsole(L"新传出带宽上限 (KB/s) 或 -1 禁用: ");
+                SafeWriteConsole(L"(单位: KB/s) 或 -1 禁用\n传出带宽限制: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") netLimit = -1; else try { netLimit = std::stoi(input); } catch(...) {}
             } else if (choice == L"8") {
-                SafeWriteConsole(L"新物理内存上限 (格式: 最小MB-最大MB) 或 -1 禁用: ");
+                SafeWriteConsole(L"(格式: 最小MB-最大MB) 或 -1 禁用\n物理内存限制: ");
                 std::wstring input = SafeReadConsole();
                 if (input == L"-1") { workingSet = {0, 0}; }
                 else {
@@ -754,7 +752,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             } else if (choice == L"exit") {
                 break;
             } else {
-                SafeWriteConsole(L"无效的选择, 请按回车键重试...");
+                SafeWriteConsole(L"无效的选择 按回车键重试...");
                 SafeReadConsole();
                 settingChanged = false;
             }

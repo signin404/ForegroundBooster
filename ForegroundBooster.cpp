@@ -11,10 +11,10 @@
 #include <sstream>
 #include <processthreadsapi.h>
 #include <locale>
-#include <cstdio> 
-#include <algorithm> 
-#include <tlhelp32.h> 
-#include <cstdarg> 
+#include <cstdio>
+#include <algorithm>
+#include <tlhelp32.h>
+#include <cstdarg>
 #include <atomic>
 
 #pragma comment(lib, "dwmapi.lib")
@@ -396,7 +396,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
 
     DWORD currentProcessId = 0;
     DWORD currentThreadId = 0;
-    
+
     currentThreadId = GetWindowThreadProcessId(hwnd, &currentProcessId);
 
     if (currentProcessId == 0 || currentProcessId == lastProcessId)
@@ -436,34 +436,37 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                 SetProcessIoPriority(hNewProcess, IoPriorityHigh);
                 LogColor(COLOR_SUCCESS, "  -> I/O优先级已提升为高\n");
             }
-            
-            if (!blackListJob.count(processNameLower))
+
+            if (settings.dscp >= 0 || settings.weight >= 1 || settings.scheduling >= 0)
             {
-                std::wstring jobName = L"Global\\ForegroundBoosterJob_PID_" + std::to_wstring(currentProcessId);
-                HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
-                if (hJob)
+                if (!blackListJob.count(processNameLower))
                 {
-                    Log("  -> 已创建作业对象: %ws\n", jobName.c_str());
-                    ApplyJobObjectSettings(hJob, processNameLower);
-                    if (AssignProcessToJobObject(hJob, hNewProcess))
+                    std::wstring jobName = L"Global\\ForegroundBoosterJob_" + processNameLower + L"_" + std::to_wstring(currentProcessId);
+                    HANDLE hJob = CreateJobObjectW(NULL, jobName.c_str());
+                    if (hJob)
                     {
-                        LogColor(COLOR_SUCCESS, "  -> 成功将进程分配到已配置的作业对象\n");
-                        managedJobs[currentProcessId] = hJob;
+                        Log("  -> 已创建作业对象: %ws\n", jobName.c_str());
+                        ApplyJobObjectSettings(hJob, processNameLower);
+                        if (AssignProcessToJobObject(hJob, hNewProcess))
+                        {
+                            LogColor(COLOR_SUCCESS, "  -> 成功将进程分配到已配置的作业对象\n");
+                            managedJobs[currentProcessId] = hJob;
+                        }
+                        else
+                        {
+                            LogColor(COLOR_ERROR, "  -> 失败: 无法将进程分配到作业对象 错误码: %lu (进程处于另一个作业中)\n", GetLastError());
+                            CloseHandle(hJob);
+                        }
                     }
                     else
                     {
-                        LogColor(COLOR_ERROR, "  -> 失败: 无法将进程分配到作业对象 错误码: %lu (进程可能已在另一个作业中)\n", GetLastError());
-                        CloseHandle(hJob);
+                        LogColor(COLOR_ERROR, "  -> 失败: 无法创建作业对象 错误码: %lu\n", GetLastError());
                     }
                 }
                 else
                 {
-                    LogColor(COLOR_ERROR, "  -> 失败: 无法创建作业对象 错误码: %lu\n", GetLastError());
+                    LogColor(COLOR_WARNING, "  -> 进程位于作业对象黑名单中 跳过Job Object操作\n");
                 }
-            }
-            else
-            {
-                LogColor(COLOR_WARNING, "  -> 进程位于作业对象黑名单中 跳过Job Object操作\n");
             }
             CloseHandle(hNewProcess);
         }
@@ -472,7 +475,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
             DWORD lastError = GetLastError();
             if (lastError == 5)
             {
-                LogColor(COLOR_ERROR, "  -> 失败: 打开进程句柄时被拒绝访问(错误码 5) \n");
+                LogColor(COLOR_ERROR, "  -> 失败: 打开进程句柄时被拒绝访问 错误码: 5\n");
             }
             else
             {
@@ -567,7 +570,7 @@ void EventMessageLoopThread()
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    
+
     if(g_hForegroundHook) UnhookWinEvent(g_hForegroundHook);
 }
 
@@ -608,7 +611,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         SetConsoleOutputCP(65001);
         freopen_s(&f, "CONOUT$", "w", stdout);
     }
-    
+
     EnableAllPrivileges();
 
     wchar_t exePath[MAX_PATH];
@@ -617,18 +620,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     size_t lastDot = path.find_last_of(L".");
     if (lastDot != std::wstring::npos) path = path.substr(0, lastDot);
     path += L".ini";
-    
+
     ParseIniFile(path);
-    
+
     LogColor(COLOR_INFO, "--- 正在启动所有后台线程 ---\n");
-    
+
     std::thread t1(EventMessageLoopThread);
     std::thread t2(DwmThread);
     std::thread t3(ProcessListCheckThread);
-    
+
     t1.join();
     t2.join();
     t3.join();
-    
+
     return 0;
 }

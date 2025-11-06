@@ -545,19 +545,31 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                     {
                         ULONG requiredSize = 0;
                         pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
+                        
                         if (requiredSize > 0)
                         {
                             isCpuSetRestricted = true;
                             LogColor(COLOR_INFO, "     - Info: 进程受 CPU Sets 限制。将基于此列表进行检查。\n");
                             
-                            std::vector<SYSTEM_CPU_SET_INFORMATION> cpuSets(requiredSize / sizeof(SYSTEM_CPU_SET_INFORMATION));
+                            // 正确的类型是 ULONG 向量
+                            std::vector<ULONG> cpuSetIds(requiredSize / sizeof(ULONG));
 
-                            if (pGetProcessDefaultCpuSets(hNewProcess, (PULONG)cpuSets.data(), (ULONG)cpuSets.size() * sizeof(SYSTEM_CPU_SET_INFORMATION), &requiredSize))
+                            if (pGetProcessDefaultCpuSets(hNewProcess, cpuSetIds.data(), (ULONG)cpuSetIds.size() * sizeof(ULONG), &requiredSize))
                             {
-                                for (const auto& cpuSetInfo : cpuSets)
+                                // --- 新增的诊断日志 ---
+                                std::wstring id_list_str = L"";
+                                for (size_t i = 0; i < cpuSetIds.size(); ++i) {
+                                    id_list_str += std::to_wstring(cpuSetIds[i]);
+                                    if (i < cpuSetIds.size() - 1) {
+                                        id_list_str += L", ";
+                                    }
+                                }
+                                LogColor(COLOR_WARNING, "     - 诊断: API返回的CPU Set ID列表: [%ws]\n", id_list_str.c_str());
+                                // --- 诊断日志结束 ---
+
+                                for (ULONG coreId : cpuSetIds)
                                 {
-                                    // --- 修改点: 使用正确的成员访问方式 cpuSetInfo.CpuSet.Id ---
-                                    if (cpuSetInfo.CpuSet.Id == (ULONG)settings.idealCore)
+                                    if (coreId == (ULONG)settings.idealCore)
                                     {
                                         isCoreAllowed = true;
                                         LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程的 CPU Sets 列表中。\n", settings.idealCore);

@@ -553,7 +553,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                     {
                         // 动态加载 GetProcessDefaultCpuSets 以兼容旧版系统
                         using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-                        GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandle(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+                        GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
 
                         if (pGetProcessDefaultCpuSets)
                         {

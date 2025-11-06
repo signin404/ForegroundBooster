@@ -525,97 +525,101 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
             }
             // --- 新增: 设置主线程理想核心的逻辑 ---
             if (settings.idealCore >= 0)
+{
+    LogColor(COLOR_INFO, "  -> [理想核心] 正在检查理想核心设置 (配置为: %d)...\n", settings.idealCore);
+    std::pair<std::wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
+
+    if (idealCoreCache.count(cacheKey))
+    {
+        LogColor(COLOR_SUCCESS, "     - 跳过: 进程已在缓存中，之前已设置成功。\n");
+    }
+    else
+    {
+        bool isCoreAllowed = false;
+        
+        using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
+        using GetSystemCpuSetInformationPtr = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+        using SetThreadIdealProcessorExPtr = BOOL(WINAPI*)(HANDLE, PPROCESSOR_NUMBER, PPROCESSOR_NUMBER);
+
+        auto pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+        auto pGetSystemCpuSetInformation = (GetSystemCpuSetInformationPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation");
+        auto pSetThreadIdealProcessorEx = (SetThreadIdealProcessorExPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadIdealProcessorEx");
+
+        if (pGetProcessDefaultCpuSets && pGetSystemCpuSetInformation && pSetThreadIdealProcessorEx)
+        {
+            // Step 1: Get the full system CPU map to perform translations
+            ULONG requiredSize = 0;
+            pGetSystemCpuSetInformation(NULL, 0, &requiredSize, GetCurrentProcess(), 0);
+            if (requiredSize > 0)
             {
-                LogColor(COLOR_INFO, "  -> [理想核心] 正在检查理想核心设置 (配置为: %d)...\n", settings.idealCore);
-                std::pair<std::wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
-
-                if (idealCoreCache.count(cacheKey))
+                std::vector<SYSTEM_CPU_SET_INFORMATION> systemCpuSets(requiredSize / sizeof(SYSTEM_CPU_SET_INFORMATION));
+                if (pGetSystemCpuSetInformation(systemCpuSets.data(), (ULONG)systemCpuSets.size() * sizeof(SYSTEM_CPU_SET_INFORMATION), &requiredSize, GetCurrentProcess(), 0))
                 {
-                    LogColor(COLOR_SUCCESS, "     - 跳过: 进程已在缓存中，之前已设置成功。\n");
-                }
-                else
-                {
-                    bool isCoreAllowed = false;
-                    
-                    using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-                    using GetSystemCpuSetInformationPtr = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
-                    using SetThreadIdealProcessorExPtr = BOOL(WINAPI*)(HANDLE, PPROCESSOR_NUMBER, PPROCESSOR_NUMBER);
+                    // 【修复开始】
+                    // Step 2: 翻译扁平化的 IdealCore 索引到 PROCESSOR_NUMBER 和 CPU Set ID (健壮方法)
+                    ULONG targetCpuSetId = ULONG_MAX;
+                    PROCESSOR_NUMBER targetProcessorNumber = {};
+                    bool targetFound = false;
 
-                    auto pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
-                    auto pGetSystemCpuSetInformation = (GetSystemCpuSetInformationPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation");
-                    auto pSetThreadIdealProcessorEx = (SetThreadIdealProcessorExPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadIdealProcessorEx");
+                    // 首先, 筛选出真正的CPU核心信息
+                    std::vector<SYSTEM_CPU_SET_INFORMATION> availableCpuSets;
+                    for (const auto& setInfo : systemCpuSets) {
+                        if (setInfo.Type == CpuSetInformation) {
+                            availableCpuSets.push_back(setInfo);
+                        }
+                    }
 
-                    if (pGetProcessDefaultCpuSets && pGetSystemCpuSetInformation && pSetThreadIdealProcessorEx)
-                    {
-                        // Step 1: Get the full system CPU map to perform translations
-                        ULONG requiredSize = 0;
-                        pGetSystemCpuSetInformation(NULL, 0, &requiredSize, GetCurrentProcess(), 0);
-                        if (requiredSize > 0)
-                        {
-                            std::vector<SYSTEM_CPU_SET_INFORMATION> systemCpuSets(requiredSize / sizeof(SYSTEM_CPU_SET_INFORMATION));
-                            if (pGetSystemCpuSetInformation(systemCpuSets.data(), (ULONG)systemCpuSets.size() * sizeof(SYSTEM_CPU_SET_INFORMATION), &requiredSize, GetCurrentProcess(), 0))
-                            {
-                                // Step 2: Translate the flat IdealCore index into a PROCESSOR_NUMBER and a CPU Set ID
-                                ULONG targetCpuSetId = ULONG_MAX;
-                                PROCESSOR_NUMBER targetProcessorNumber = {};
-                                bool targetFound = false;
+                    // 其次, 对列表进行排序以确保可预测的、规范的顺序
+                    std::sort(availableCpuSets.begin(), availableCpuSets.end(), [](const SYSTEM_CPU_SET_INFORMATION& a, const SYSTEM_CPU_SET_INFORMATION& b) {
+                        if (a.CpuSet.Group != b.CpuSet.Group) {
+                            return a.CpuSet.Group < b.CpuSet.Group;
+                        }
+                        return a.CpuSet.LogicalProcessorIndex < b.CpuSet.LogicalProcessorIndex;
+                    });
 
-                                // We need to know group boundaries to calculate the flat index correctly
-                                std::map<WORD, BYTE> groupProcessorCount;
-                                for (const auto& setInfo : systemCpuSets) {
-                                    if (setInfo.Type == CpuSetInformation) {
-                                        groupProcessorCount[setInfo.CpuSet.Group]++;
+                    // 第三, 从排序后的列表中选择第 N 个核心
+                    if (settings.idealCore >= 0 && settings.idealCore < availableCpuSets.size()) {
+                        const auto& targetSet = availableCpuSets[settings.idealCore];
+                        targetProcessorNumber.Group = targetSet.CpuSet.Group;
+                        targetProcessorNumber.Number = targetSet.CpuSet.LogicalProcessorIndex;
+                        targetCpuSetId = targetSet.CpuSet.Id;
+                        targetFound = true;
+                        LogColor(COLOR_INFO, "     - 诊断: 理想核心 %d 被翻译为 (组: %d, 索引: %d)。\n", settings.idealCore, targetProcessorNumber.Group, targetProcessorNumber.Number);
+                        LogColor(COLOR_INFO, "     - 诊断: 对应的CPU Set ID为 %lu。\n", targetCpuSetId);
+                    }
+                    // 【修复结束】
+
+                    // Step 3: Check if the target CPU Set ID is allowed for the process
+                    if (targetFound) { // 使用 targetFound 替代 targetCpuSetId != ULONG_MAX
+                        pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
+                        if (requiredSize > 0) {
+                            std::vector<ULONG> processCpuSetIds(requiredSize / sizeof(ULONG));
+                            if (pGetProcessDefaultCpuSets(hNewProcess, processCpuSetIds.data(), (ULONG)processCpuSetIds.size() * sizeof(ULONG), &requiredSize)) {
+                                for (ULONG allowedId : processCpuSetIds) {
+                                    if (allowedId == targetCpuSetId) {
+                                        isCoreAllowed = true;
+                                        break;
                                     }
                                 }
-
-                                int currentFlatIndex = 0;
-                                for (WORD groupIndex = 0; groupIndex < groupProcessorCount.size(); ++groupIndex) {
-                                    for (BYTE processorIndex = 0; processorIndex < groupProcessorCount[groupIndex]; ++processorIndex) {
-                                        if (currentFlatIndex == settings.idealCore) {
-                                            targetProcessorNumber.Group = groupIndex;
-                                            targetProcessorNumber.Number = processorIndex;
-                                            targetFound = true;
-                                            break;
-                                        }
-                                        currentFlatIndex++;
+                            }
+                        } else { // No specific CPU sets, check affinity
+                            DWORD_PTR processAffinityMask, systemAffinityMask;
+                            if (GetProcessAffinityMask(hNewProcess, &processAffinityMask, &systemAffinityMask)) {
+                                // 在检查亲和性时，也应该使用翻译后的 Group 和 Number 来构建掩码，而不是直接用 idealCore
+                                PROCESSOR_NUMBER procNum = {};
+                                GetCurrentProcessorNumberEx(&procNum); // 获取当前组信息
+                                if (targetProcessorNumber.Group == procNum.Group) { // 简化处理，仅处理同一组内的亲和性
+                                    if ((processAffinityMask & (1ULL << targetProcessorNumber.Number))) {
+                                        isCoreAllowed = true;
                                     }
-                                    if (targetFound) break;
+                                } else {
+                                    // 跨组亲和性检查更复杂，但对于大多数现代PC，CPU Sets是首选方法
+                                    // 如果进程没有设置CPU Sets，它通常可以使用所有核心
+                                    isCoreAllowed = true; 
                                 }
-                                
-                                if (targetFound) {
-                                    LogColor(COLOR_INFO, "     - 诊断: 理想核心 %d 被翻译为 (组: %d, 索引: %d)。\n", settings.idealCore, targetProcessorNumber.Group, targetProcessorNumber.Number);
-                                    // Now find the CPU Set ID for this specific PROCESSOR_NUMBER
-                                    for (const auto& setInfo : systemCpuSets) {
-                                        if (setInfo.Type == CpuSetInformation && setInfo.CpuSet.Group == targetProcessorNumber.Group && setInfo.CpuSet.LogicalProcessorIndex == targetProcessorNumber.Number) {
-                                            targetCpuSetId = setInfo.CpuSet.Id;
-                                            LogColor(COLOR_INFO, "     - 诊断: 对应的CPU Set ID为 %lu。\n", targetCpuSetId);
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Step 3: Check if the target CPU Set ID is allowed for the process
-                                if (targetCpuSetId != ULONG_MAX) {
-                                    pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
-                                    if (requiredSize > 0) {
-                                        std::vector<ULONG> processCpuSetIds(requiredSize / sizeof(ULONG));
-                                        if (pGetProcessDefaultCpuSets(hNewProcess, processCpuSetIds.data(), (ULONG)processCpuSetIds.size() * sizeof(ULONG), &requiredSize)) {
-                                            for (ULONG allowedId : processCpuSetIds) {
-                                                if (allowedId == targetCpuSetId) {
-                                                    isCoreAllowed = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } else { // No specific CPU sets, check affinity
-                                        DWORD_PTR processAffinityMask, systemAffinityMask;
-                                        if (GetProcessAffinityMask(hNewProcess, &processAffinityMask, &systemAffinityMask)) {
-                                            if ((processAffinityMask & (1ULL << settings.idealCore))) {
-                                                isCoreAllowed = true;
-                                            }
-                                        }
-                                    }
-                                }
+                            }
+                        }
+                    }
 
                                 // Step 4: If allowed, set the ideal processor using the modern API
                                 if (isCoreAllowed) {

@@ -539,9 +539,12 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                     bool isCpuSetRestricted = false; 
 
                     using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-                    GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+                    using GetSystemCpuSetInformationPtr = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
 
-                    if (pGetProcessDefaultCpuSets)
+                    auto pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+                    auto pGetSystemCpuSetInformation = (GetSystemCpuSetInformationPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation");
+
+                    if (pGetProcessDefaultCpuSets && pGetSystemCpuSetInformation)
                     {
                         ULONG requiredSize = 0;
                         pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
@@ -549,31 +552,34 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                         if (requiredSize > 0)
                         {
                             isCpuSetRestricted = true;
-                            LogColor(COLOR_INFO, "     - Info: 进程受 CPU Sets 限制。将基于此列表进行检查。\n");
+                            LogColor(COLOR_INFO, "     - Info: 进程受 CPU Sets 限制。将执行ID到逻辑核心的转换检查。\n");
                             
-                            // 正确的类型是 ULONG 向量
-                            std::vector<ULONG> cpuSetIds(requiredSize / sizeof(ULONG));
+                            std::vector<ULONG> processCpuSetIds(requiredSize / sizeof(ULONG));
+                            pGetProcessDefaultCpuSets(hNewProcess, processCpuSetIds.data(), (ULONG)processCpuSetIds.size() * sizeof(ULONG), &requiredSize);
+                            
+                            // 为了快速查找，将进程的ID放入一个set中
+                            std::set<ULONG> allowedIds(processCpuSetIds.begin(), processCpuSetIds.end());
 
-                            if (pGetProcessDefaultCpuSets(hNewProcess, cpuSetIds.data(), (ULONG)cpuSetIds.size() * sizeof(ULONG), &requiredSize))
+                            // 现在获取系统所有的CPU Set信息来进行“翻译”
+                            pGetSystemCpuSetInformation(NULL, 0, &requiredSize, GetCurrentProcess(), 0);
+                            if (requiredSize > 0)
                             {
-                                // --- 新增的诊断日志 ---
-                                std::wstring id_list_str = L"";
-                                for (size_t i = 0; i < cpuSetIds.size(); ++i) {
-                                    id_list_str += std::to_wstring(cpuSetIds[i]);
-                                    if (i < cpuSetIds.size() - 1) {
-                                        id_list_str += L", ";
-                                    }
-                                }
-                                LogColor(COLOR_WARNING, "     - 诊断: API返回的CPU Set ID列表: [%ws]\n", id_list_str.c_str());
-                                // --- 诊断日志结束 ---
-
-                                for (ULONG coreId : cpuSetIds)
+                                std::vector<SYSTEM_CPU_SET_INFORMATION> systemCpuSets(requiredSize / sizeof(SYSTEM_CPU_SET_INFORMATION));
+                                if (pGetSystemCpuSetInformation(systemCpuSets.data(), (ULONG)systemCpuSets.size() * sizeof(SYSTEM_CPU_SET_INFORMATION), &requiredSize, GetCurrentProcess(), 0))
                                 {
-                                    if (coreId == (ULONG)settings.idealCore)
+                                    for (const auto& setInfo : systemCpuSets)
                                     {
-                                        isCoreAllowed = true;
-                                        LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程的 CPU Sets 列表中。\n", settings.idealCore);
-                                        break;
+                                        // 检查这个系统核心的ID是否在进程允许的ID列表中
+                                        if (allowedIds.count(setInfo.CpuSet.Id))
+                                        {
+                                            // 如果是，再检查这个核心的逻辑编号是否是我们想要的
+                                            if (setInfo.CpuSet.LogicalProcessorIndex == (BYTE)settings.idealCore)
+                                            {
+                                                isCoreAllowed = true;
+                                                LogColor(COLOR_SUCCESS, "     - 检查通过: 理想核心 %d (对应ID %lu) 在进程允许的CPU Sets中。\n", settings.idealCore, setInfo.CpuSet.Id);
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }

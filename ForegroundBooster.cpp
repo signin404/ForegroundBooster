@@ -65,7 +65,7 @@ std::map<DWORD, IO_PRIORITY_HINT> originalIoPriorities;
 DWORD lastProcessId = 0;
 DWORD lastAttachedThreadId = 0;
 
-// 用于缓存已处理或已跳过的进程，避免重复操作
+// 用于缓存已处理或已跳过的进程 避免重复操作
 std::set<std::pair<std::wstring, DWORD>> idealCoreSetCache;
 std::set<std::pair<std::wstring, DWORD>> idealCoreSkippedCache;
 
@@ -339,7 +339,7 @@ struct ThreadInfo {
     FILETIME creationTime;
 };
 
-// 比较函数，用于根据创建时间对线程进行排序
+// 比较函数 用于根据创建时间对线程进行排序
 bool CompareThreadsByCreationTime(const ThreadInfo& a, const ThreadInfo& b) {
     // CompareFileTime 返回 -1 如果 a < b, 0 如果 a == b, 1 如果 a > b
     return CompareFileTime(&a.creationTime, &b.creationTime) < 0;
@@ -379,7 +379,7 @@ DWORD GetProcessMainThreadId(DWORD dwProcessId) {
         return 0; // 未找到任何线程
     }
 
-    // 根据创建时间排序，找到最早创建的线程
+    // 根据创建时间排序 找到最早创建的线程
     std::sort(threads.begin(), threads.end(), CompareThreadsByCreationTime);
 
     return threads[0].threadId;
@@ -533,11 +533,11 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
 
                 if (idealCoreSetCache.count(processKey))
                 {
-                    LogColor(COLOR_INFO, "  -> 理想核心: 进程已在成功缓存中，跳过。\n");
+                    LogColor(COLOR_INFO, "  -> 理想核心: 进程已在成功缓存中 跳过\n");
                 }
                 else if (idealCoreSkippedCache.count(processKey))
                 {
-                    LogColor(COLOR_INFO, "  -> 理想核心: 进程已在跳过缓存中，跳过。\n");
+                    LogColor(COLOR_INFO, "  -> 理想核心: 进程已在跳过缓存中 跳过\n");
                 }
                 else
                 {
@@ -549,7 +549,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                         // 并且理想核心不在亲和性掩码内
                         if (processAffinity != systemAffinity && (processAffinity & (1ULL << settings.idealCore)) == 0)
                         {
-                            LogColor(COLOR_WARNING, "     - 跳过: 理想核心 %d 不在进程的自定义亲和性掩码 (%llu) 范围内。\n", settings.idealCore, processAffinity);
+                            LogColor(COLOR_WARNING, "     - 跳过: 理想核心 %d 不在亲和性 (%llu) 范围内\n", settings.idealCore, processAffinity);
                             idealCoreSkippedCache.insert(processKey);
                         }
                         else
@@ -562,29 +562,29 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                                 {
                                     if (SetThreadIdealProcessor(hMainThread, settings.idealCore) != (DWORD)-1)
                                     {
-                                        LogColor(COLOR_SUCCESS, "     - 成功: 已将主线程 %lu 的理想核心设置为 %d。\n", mainThreadId, settings.idealCore);
+                                        LogColor(COLOR_SUCCESS, "     - 成功: 已将主线程 %lu 的理想核心设置为 %d\n", mainThreadId, settings.idealCore);
                                         idealCoreSetCache.insert(processKey);
                                     }
                                     else
                                     {
-                                        LogColor(COLOR_ERROR, "     - 失败: 调用 SetThreadIdealProcessor 失败。错误码: %lu\n", GetLastError());
+                                        LogColor(COLOR_ERROR, "     - 失败: 调用 SetThreadIdealProcessor 失败 错误码: %lu\n", GetLastError());
                                     }
                                     CloseHandle(hMainThread);
                                 }
                                 else
                                 {
-                                    LogColor(COLOR_ERROR, "     - 失败: 无法打开主线程句柄。错误码: %lu\n", GetLastError());
+                                    LogColor(COLOR_ERROR, "     - 失败: 无法打开主线程句柄 错误码: %lu\n", GetLastError());
                                 }
                             }
                             else
                             {
-                                LogColor(COLOR_ERROR, "     - 失败: 无法找到进程的主线程。\n");
+                                LogColor(COLOR_ERROR, "     - 失败: 无法找到进程的主线程\n");
                             }
                         }
                     }
                     else
                     {
-                        LogColor(COLOR_ERROR, "     - 失败: 无法获取进程亲和性掩码。错误码: %lu\n", GetLastError());
+                        LogColor(COLOR_ERROR, "     - 失败: 无法获取进程亲和性掩码 错误码: %lu\n", GetLastError());
                     }
                 }
             }

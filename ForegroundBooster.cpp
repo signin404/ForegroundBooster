@@ -16,6 +16,10 @@
 #include <tlhelp32.h>
 #include <cstdarg>
 #include <atomic>
+#include <set>
+#include <utility>
+
+std::set<std::pair<std::wstring, DWORD>> idealCoreCache;
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -56,6 +60,7 @@ struct Settings
     int scheduling = -1;
     int weight = -1;
     int processListInterval = 60;
+    int idealCore = -1;
 };
 Settings settings;
 std::set<std::wstring> blackList, whiteList, blackListJob;
@@ -204,6 +209,7 @@ void ParseIniFile(const std::wstring& path)
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
                     else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
+                    else if (key == L"IdealCore") settings.idealCore = std::stoi(value);
                 }
             }
             else if (currentSection == L"BlackList")
@@ -387,6 +393,55 @@ void ScanAndResetIoPriorities()
     LogColor(COLOR_INFO, "[后台扫描] 扫描完成 当前缓存 %zu 个进程\n", processCache.size());
 }
 
+// --- 新增函数: 获取进程的主线程ID ---
+// 通过遍历线程并比较创建时间来找到第一个创建的线程
+DWORD GetProcessMainThreadId(DWORD dwProcessId)
+{
+    struct ThreadInfo {
+        DWORD threadId;
+        FILETIME creationTime;
+    };
+
+    std::vector<ThreadInfo> threads;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    THREADENTRY32 te32;
+    te32.dwSize = sizeof(THREADENTRY32);
+
+    if (Thread32First(hSnapshot, &te32)) {
+        do {
+            if (te32.th32OwnerProcessID == dwProcessId) {
+                HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
+                if (hThread) {
+                    ThreadInfo info;
+                    info.threadId = te32.th32ThreadID;
+                    FILETIME exitTime, kernelTime, userTime;
+                    if (GetThreadTimes(hThread, &info.creationTime, &exitTime, &kernelTime, &userTime)) {
+                        threads.push_back(info);
+                    }
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(hSnapshot, &te32));
+    }
+
+    CloseHandle(hSnapshot);
+
+    if (threads.empty()) {
+        return 0;
+    }
+
+    // 根据创建时间排序，找到最早创建的线程
+    std::sort(threads.begin(), threads.end(), [](const ThreadInfo& a, const ThreadInfo& b) {
+        return CompareFileTime(&a.creationTime, &b.creationTime) < 0;
+    });
+
+    return threads[0].threadId;
+}
+
 void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime)
 {
     if (event != EVENT_SYSTEM_FOREGROUND || !hwnd)
@@ -466,6 +521,96 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                 else
                 {
                     LogColor(COLOR_WARNING, "  -> 进程位于作业对象黑名单中 跳过Job Object操作\n");
+                }
+            }
+            // --- 新增: 设置主线程理想核心的逻辑 ---
+            if (settings.idealCore >= 0)
+            {
+                LogColor(COLOR_INFO, "  -> [理想核心] 正在检查理想核心设置 (配置为: %d)...\n", settings.idealCore);
+                std::pair<std::wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
+
+                if (idealCoreCache.count(cacheKey))
+                {
+                    LogColor(COLOR_SUCCESS, "     - 跳过: 进程已在缓存中，之前已设置成功。\n");
+                }
+                else
+                {
+                    bool isCoreAllowed = false;
+                    
+                    // 1. 检查进程亲和性 (Process Affinity)
+                    DWORD_PTR processAffinityMask, systemAffinityMask;
+                    if (GetProcessAffinityMask(hNewProcess, &processAffinityMask, &systemAffinityMask))
+                    {
+                        if ((processAffinityMask & (1ULL << settings.idealCore)))
+                        {
+                            isCoreAllowed = true;
+                            LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程亲和性掩码 (0x%llX) 范围内。\n", settings.idealCore, processAffinityMask);
+                        }
+                    }
+
+                    // 2. 如果亲和性未设置或不匹配，检查 CPU Sets (适用于较新的Windows版本)
+                    if (!isCoreAllowed)
+                    {
+                        // 动态加载 GetProcessDefaultCpuSets 以兼容旧版系统
+                        using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
+                        GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandle(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+
+                        if (pGetProcessDefaultCpuSets)
+                        {
+                            ULONG requiredSize = 0;
+                            pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
+                            if (requiredSize > 0)
+                            {
+                                std::vector<ULONG> cpuSetIds(requiredSize / sizeof(ULONG));
+                                if (pGetProcessDefaultCpuSets(hNewProcess, cpuSetIds.data(), (ULONG)cpuSetIds.size() * sizeof(ULONG), &requiredSize))
+                                {
+                                    for (ULONG coreId : cpuSetIds)
+                                    {
+                                        if (coreId == (ULONG)settings.idealCore)
+                                        {
+                                            isCoreAllowed = true;
+                                            LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程的 CPU Sets 列表中。\n", settings.idealCore);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (isCoreAllowed)
+                    {
+                        DWORD mainThreadId = GetProcessMainThreadId(currentProcessId);
+                        if (mainThreadId != 0)
+                        {
+                            HANDLE hMainThread = OpenThread(THREAD_SET_INFORMATION, FALSE, mainThreadId);
+                            if (hMainThread)
+                            {
+                                if (SetThreadIdealProcessor(hMainThread, settings.idealCore) != (DWORD)-1)
+                                {
+                                    LogColor(COLOR_SUCCESS, "     - 成功: 已将主线程 %lu 的理想核心设置为 %d。\n", mainThreadId, settings.idealCore);
+                                    idealCoreCache.insert(cacheKey); // 添加到缓存
+                                }
+                                else
+                                {
+                                    LogColor(COLOR_ERROR, "     - 失败: 设置主线程 %lu 的理想核心时出错。错误码: %lu\n", mainThreadId, GetLastError());
+                                }
+                                CloseHandle(hMainThread);
+                            }
+                            else
+                            {
+                                LogColor(COLOR_ERROR, "     - 失败: 无法打开主线程 %lu 的句柄。错误码: %lu\n", mainThreadId, GetLastError());
+                            }
+                        }
+                        else
+                        {
+                            LogColor(COLOR_ERROR, "     - 失败: 无法找到进程的主线程。\n");
+                        }
+                    }
+                    else
+                    {
+                        LogColor(COLOR_WARNING, "     - 跳过: 配置的理想核心 %d 不在进程的亲和性或CPU Sets允许范围内。\n", settings.idealCore);
+                    }
                 }
             }
             CloseHandle(hNewProcess);

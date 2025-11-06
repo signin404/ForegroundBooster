@@ -550,16 +550,14 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                             isCpuSetRestricted = true;
                             LogColor(COLOR_INFO, "     - Info: 进程受 CPU Sets 限制。将基于此列表进行检查。\n");
                             
-                            // --- 修改 1: 使用正确的结构体类型 ---
                             std::vector<SYSTEM_CPU_SET_INFORMATION> cpuSets(requiredSize / sizeof(SYSTEM_CPU_SET_INFORMATION));
 
-                            // --- 修改 2: 将 vector 的指针传递给 API ---
                             if (pGetProcessDefaultCpuSets(hNewProcess, (PULONG)cpuSets.data(), (ULONG)cpuSets.size() * sizeof(SYSTEM_CPU_SET_INFORMATION), &requiredSize))
                             {
-                                // --- 修改 3: 迭代结构体并检查 .Id 成员 ---
                                 for (const auto& cpuSetInfo : cpuSets)
                                 {
-                                    if (cpuSetInfo.Id == (ULONG)settings.idealCore)
+                                    // --- 修改点: 使用正确的成员访问方式 cpuSetInfo.CpuSet.Id ---
+                                    if (cpuSetInfo.CpuSet.Id == (ULONG)settings.idealCore)
                                     {
                                         isCoreAllowed = true;
                                         LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程的 CPU Sets 列表中。\n", settings.idealCore);

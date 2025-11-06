@@ -527,7 +527,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
             if (settings.idealCore >= 0)
             {
                 LogColor(COLOR_INFO, "  -> [理想核心] 正在检查理想核心设置 (配置为: %d)...\n", settings.idealCore);
-                std::pair<std.wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
+                std::pair<std::wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
 
                 if (idealCoreCache.count(cacheKey))
                 {

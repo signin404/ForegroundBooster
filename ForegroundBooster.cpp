@@ -527,7 +527,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
             if (settings.idealCore >= 0)
             {
                 LogColor(COLOR_INFO, "  -> [理想核心] 正在检查理想核心设置 (配置为: %d)...\n", settings.idealCore);
-                std::pair<std::wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
+                std::pair<std.wstring, DWORD> cacheKey = { processNameLower, currentProcessId };
 
                 if (idealCoreCache.count(cacheKey))
                 {
@@ -536,48 +536,52 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
                 else
                 {
                     bool isCoreAllowed = false;
-                    
-                    // 1. 检查进程亲和性 (Process Affinity)
-                    DWORD_PTR processAffinityMask, systemAffinityMask;
-                    if (GetProcessAffinityMask(hNewProcess, &processAffinityMask, &systemAffinityMask))
-                    {
-                        if ((processAffinityMask & (1ULL << settings.idealCore)))
-                        {
-                            isCoreAllowed = true;
-                            LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程亲和性掩码 (0x%llX) 范围内。\n", settings.idealCore, processAffinityMask);
-                        }
-                    }
+                    bool isCpuSetRestricted = false; // 标记进程是否受CPU Sets的明确限制
 
-                    // 2. 如果亲和性未设置或不匹配，检查 CPU Sets (适用于较新的Windows版本)
-                    if (!isCoreAllowed)
-                    {
-                        // 动态加载 GetProcessDefaultCpuSets 以兼容旧版系统
-                        using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-                        GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
+                    // 1. 优先检查 CPU Sets (更现代、更精确的机制)
+                    using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
+                    GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDefaultCpuSets");
 
-                        if (pGetProcessDefaultCpuSets)
+                    if (pGetProcessDefaultCpuSets)
+                    {
+                        ULONG requiredSize = 0;
+                        pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
+                        if (requiredSize > 0)
                         {
-                            ULONG requiredSize = 0;
-                            pGetProcessDefaultCpuSets(hNewProcess, NULL, 0, &requiredSize);
-                            if (requiredSize > 0)
+                            isCpuSetRestricted = true; // 找到了明确的CPU Sets，这将是唯一依据
+                            LogColor(COLOR_INFO, "     - Info: 进程受 CPU Sets 限制。将基于此列表进行检查。\n");
+                            std::vector<ULONG> cpuSetIds(requiredSize / sizeof(ULONG));
+                            if (pGetProcessDefaultCpuSets(hNewProcess, cpuSetIds.data(), (ULONG)cpuSetIds.size() * sizeof(ULONG), &requiredSize))
                             {
-                                std::vector<ULONG> cpuSetIds(requiredSize / sizeof(ULONG));
-                                if (pGetProcessDefaultCpuSets(hNewProcess, cpuSetIds.data(), (ULONG)cpuSetIds.size() * sizeof(ULONG), &requiredSize))
+                                for (ULONG coreId : cpuSetIds)
                                 {
-                                    for (ULONG coreId : cpuSetIds)
+                                    if (coreId == (ULONG)settings.idealCore)
                                     {
-                                        if (coreId == (ULONG)settings.idealCore)
-                                        {
-                                            isCoreAllowed = true;
-                                            LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程的 CPU Sets 列表中。\n", settings.idealCore);
-                                            break;
-                                        }
+                                        isCoreAllowed = true;
+                                        LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程的 CPU Sets 列表中。\n", settings.idealCore);
+                                        break;
                                     }
                                 }
                             }
                         }
                     }
 
+                    // 2. 如果进程不受 CPU Sets 限制，则回退到检查传统的亲和性掩码
+                    if (!isCpuSetRestricted)
+                    {
+                        LogColor(COLOR_INFO, "     - Info: 进程未受 CPU Sets 限制。将检查进程亲和性掩码。\n");
+                        DWORD_PTR processAffinityMask, systemAffinityMask;
+                        if (GetProcessAffinityMask(hNewProcess, &processAffinityMask, &systemAffinityMask))
+                        {
+                            if ((processAffinityMask & (1ULL << settings.idealCore)))
+                            {
+                                isCoreAllowed = true;
+                                LogColor(COLOR_INFO, "     - 检查通过: 理想核心 %d 在进程亲和性掩码 (0x%llX) 范围内。\n", settings.idealCore, processAffinityMask);
+                            }
+                        }
+                    }
+
+                    // 3. 根据最终检查结果执行操作
                     if (isCoreAllowed)
                     {
                         DWORD mainThreadId = GetProcessMainThreadId(currentProcessId);

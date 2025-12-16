@@ -33,6 +33,7 @@ HANDLE g_hConsole;
 bool g_silentMode = false;
 HWINEVENTHOOK g_hForegroundHook;
 std::atomic<bool> g_processListChanged(false);
+std::atomic<bool> g_foregroundHasChanged(false);
 
 // --- 手动定义标准 SDK 中不存在的 NT API 类型 ---
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -462,6 +463,8 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
         return;
     }
 
+    g_foregroundHasChanged = true;
+
     if (lastProcessId != 0)
     {
         Log("前台进程已变更 (原PID: %lu)\n", lastProcessId);
@@ -699,7 +702,17 @@ void ProcessListCheckThread()
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::seconds(settings.processListInterval));
-        ScanAndResetIoPriorities();
+
+        if (g_foregroundHasChanged.exchange(false))
+        {
+            // 只有在前台发生过变化时 才执行扫描和优先级重置
+            ScanAndResetIoPriorities();
+        }
+        else
+        {
+            // 如果前台没有变化 则跳过扫描 节省资源
+            Log("[后台扫描] 前台未变化 跳过本次扫描\n");
+        }
     }
 }
 

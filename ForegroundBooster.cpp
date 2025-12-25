@@ -49,6 +49,9 @@ struct ProcessStats {
     DWORD processId;
     std::map<DWORD, ThreadStats> threads;
     bool isInitialized;
+    // --- 新增 ---
+    bool ignoreMonitoring; // 标记是否因自定义亲和性而停止监控
+    // -----------
 };
 
 // 核心缓存：PID -> 进程统计数据
@@ -749,7 +752,7 @@ ULONG GetCpuSetIdFromLogicalIndex(DWORD logicalIndex, GetSystemCpuSetInformation
     ULONG returnLength = 0;
     // 第一次调用获取所需缓冲区大小
     pGetSystemCpuSetInformation(NULL, 0, &returnLength, GetCurrentProcess(), 0);
-    
+
     if (returnLength == 0) return 0;
 
     std::vector<BYTE> buffer(returnLength);
@@ -766,7 +769,7 @@ ULONG GetCpuSetIdFromLogicalIndex(DWORD logicalIndex, GetSystemCpuSetInformation
 
     while (ptr < end) {
         PSYSTEM_CPU_SET_INFORMATION entry = (PSYSTEM_CPU_SET_INFORMATION)ptr;
-        
+
         // Type 0 是 CpuSetInformation
         if (entry->Type == 0) { // CpuSetInformation
             if (entry->CpuSet.LogicalProcessorIndex == logicalIndex) {
@@ -782,41 +785,44 @@ ULONG GetCpuSetIdFromLogicalIndex(DWORD logicalIndex, GetSystemCpuSetInformation
     return 0; // 未找到
 }
 
+// --- 新增：底层线程信息定义 (用于获取线程亲和性) ---
+typedef struct _THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID TebBaseAddress;
+    CLIENT_ID ClientId;
+    ULONG_PTR AffinityMask;
+    LONG Priority;
+    LONG BasePriority;
+} THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
+
+using NtQueryInformationThreadPtr = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
+
 void ThreadOptimizerThread()
 {
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    SetThreadSelectedCpuSetsPtr pSetThreadSelectedCpuSets = 
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+
+    SetThreadSelectedCpuSetsPtr pSetThreadSelectedCpuSets =
         (SetThreadSelectedCpuSetsPtr)GetProcAddress(hKernel32, "SetThreadSelectedCpuSets");
-    GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation = 
+    GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation =
         (GetSystemCpuSetInformationPtr)GetProcAddress(hKernel32, "GetSystemCpuSetInformation");
+    NtQueryInformationThreadPtr pNtQueryInformationThread =
+        (NtQueryInformationThreadPtr)GetProcAddress(hNtdll, "NtQueryInformationThread");
 
     if (!pSetThreadSelectedCpuSets || !pGetSystemCpuSetInformation)
     {
-        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+)，将仅使用 IdealProcessor。\n");
+        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+)，优化功能受限。\n");
     }
 
-    // --- 预先解析 IdealCore 对应的 CpuSetId ---
-    ULONG idealCoreCpuSetId = 0; // IdealCore 对应的 CPU Set ID
-    ULONG mainThreadFallbackCpuSetId = 0; // IdealCore - 2 对应的 CPU Set ID
+    ULONG idealCoreCpuSetId = 0;
+    ULONG mainThreadFallbackCpuSetId = 0;
 
     if (settings.idealCore >= 0 && pGetSystemCpuSetInformation) {
         idealCoreCpuSetId = GetCpuSetIdFromLogicalIndex((DWORD)settings.idealCore, pGetSystemCpuSetInformation);
-        if (idealCoreCpuSetId != 0) {
-            LogColor(COLOR_INFO, "[CPU Sets] 逻辑核心 %d 映射为 CPU Set ID: %lu\n", settings.idealCore, idealCoreCpuSetId);
-        } else {
-            LogColor(COLOR_ERROR, "[CPU Sets] 错误: 无法找到逻辑核心 %d 的 CPU Set ID。\n", settings.idealCore);
-        }
-
-        if (settings.idealCore >= 2) { // 确保 IdealCore - 2 是有效核心
+        if (settings.idealCore >= 2) {
             mainThreadFallbackCpuSetId = GetCpuSetIdFromLogicalIndex((DWORD)(settings.idealCore - 2), pGetSystemCpuSetInformation);
-            if (mainThreadFallbackCpuSetId != 0) {
-                LogColor(COLOR_INFO, "[CPU Sets] 逻辑核心 %d (IdealCore-2) 映射为 CPU Set ID: %lu\n", settings.idealCore - 2, mainThreadFallbackCpuSetId);
-            } else {
-                LogColor(COLOR_ERROR, "[CPU Sets] 错误: 无法找到逻辑核心 %d (IdealCore-2) 的 CPU Set ID。\n", settings.idealCore - 2);
-            }
         }
     }
-    // -------------------------------------------
 
     while (true)
     {
@@ -825,6 +831,49 @@ void ThreadOptimizerThread()
         DWORD currentPid = lastProcessId;
         if (currentPid == 0) continue;
 
+        // --- 1. 快速检查：是否已标记为忽略 ---
+        {
+            std::lock_guard<std::mutex> lock(g_statsMutex);
+            // 如果缓存中存在该进程且标记为忽略，直接跳过本次循环
+            if (g_processStatsCache.count(currentPid) && g_processStatsCache[currentPid].ignoreMonitoring)
+            {
+                continue;
+            }
+        }
+
+        // --- 2. 亲和性检查 (在快照前执行，节省资源) ---
+        bool customAffinityDetected = false;
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, currentPid);
+        if (hProcess)
+        {
+            DWORD_PTR processAffinity, systemAffinity;
+            if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity))
+            {
+                if (processAffinity != systemAffinity)
+                {
+                    customAffinityDetected = true;
+                }
+            }
+            CloseHandle(hProcess);
+        }
+
+        // 如果检测到自定义亲和性，更新缓存状态并停止监控
+        if (customAffinityDetected)
+        {
+            std::lock_guard<std::mutex> lock(g_statsMutex);
+            ProcessStats& procStats = g_processStatsCache[currentPid];
+            procStats.processId = currentPid;
+
+            if (!procStats.ignoreMonitoring) // 仅在状态变更时执行
+            {
+                procStats.ignoreMonitoring = true;
+                procStats.threads.clear(); // 清空线程数据，不再需要了
+                LogColor(COLOR_WARNING, "  -> [监控停止] 进程 %lu 设置了自定义亲和性，停止追踪其线程负载。\n", currentPid);
+            }
+            continue; // 跳过后续逻辑
+        }
+
+        // --- 3. 正常监控流程 (快照与计算) ---
         FILETIME ftSystem;
         GetSystemTimeAsFileTime(&ftSystem);
         ULARGE_INTEGER now = FT2ULL(ftSystem);
@@ -858,7 +907,7 @@ void ThreadOptimizerThread()
                                 ThreadStats ts = {};
                                 ts.threadId = tid;
                                 ts.smoothedLoad = 0.0;
-                                ts.hasCpuSets = false; // 初始化为未设置
+                                ts.hasCpuSets = false;
                                 ts.assignedCpuSetId = 0;
                                 FILETIME ftExit, ftKernel, ftUser;
                                 if (GetThreadTimes(hThread, &ts.creationTime, &ftExit, &ftKernel, &ftUser))
@@ -882,9 +931,9 @@ void ThreadOptimizerThread()
                                 {
                                     ULARGE_INTEGER k = FT2ULL(ftKernel);
                                     ULARGE_INTEGER u = FT2ULL(ftUser);
-                                    
+
                                     ULONGLONG timeDelta = now.QuadPart - ts.lastCheckTime.QuadPart;
-                                    ULONGLONG workDelta = (k.QuadPart - ts.lastKernelTime.QuadPart) + 
+                                    ULONGLONG workDelta = (k.QuadPart - ts.lastKernelTime.QuadPart) +
                                                           (u.QuadPart - ts.lastUserTime.QuadPart);
 
                                     if (timeDelta > 0)
@@ -911,23 +960,15 @@ void ThreadOptimizerThread()
                 for (DWORD activeTid : currentThreadIds) {
                     if (activeTid == it->first) { exists = true; break; }
                 }
-                if (!exists) {
-                    // 如果线程退出，确保其 CPU Sets 状态被清除
-                    if (it->second.hasCpuSets) {
-                        LogColor(COLOR_DEFAULT, "  -> [优化] 线程 %lu 已退出，其 CPU Sets 状态已清除。\n", it->first);
-                    }
-                    it = procStats.threads.erase(it);
-                }
-                else {
-                    ++it;
-                }
+                if (!exists) it = procStats.threads.erase(it);
+                else ++it;
             }
 
             // --- 分析与应用策略 ---
             if (!procStats.threads.empty())
             {
                 ThreadStats* pMainThread = nullptr;
-                ThreadStats* pHeavyThread = nullptr; // 负载最重的非主线程
+                ThreadStats* pHeavyThread = nullptr;
 
                 for (auto& pair : procStats.threads)
                 {
@@ -935,12 +976,11 @@ void ThreadOptimizerThread()
                     if (pMainThread == nullptr || CompareFileTime(&t.creationTime, &pMainThread->creationTime) < 0)
                         pMainThread = &t;
                 }
-                
-                // 再次遍历，寻找最重负载的非主线程
+
                 for (auto& pair : procStats.threads)
                 {
                     ThreadStats& t = pair.second;
-                    if (pMainThread && t.threadId != pMainThread->threadId) // 排除主线程
+                    if (pMainThread && t.threadId != pMainThread->threadId)
                     {
                         if (pHeavyThread == nullptr || t.smoothedLoad > pHeavyThread->smoothedLoad)
                             pHeavyThread = &t;
@@ -949,39 +989,53 @@ void ThreadOptimizerThread()
 
                 if (pMainThread) pMainThread->isMainThread = true;
 
-                // --- 执行优化策略 (仅当配置了 IdealCore 且 CPU Sets API 可用时) ---
+                // --- 辅助 Lambda: 确保核心在线程亲和性范围内 ---
+                auto EnsureCoreInAffinity = [&](HANDLE hThread, DWORD coreIndex) {
+                    if (!pNtQueryInformationThread) return;
+                    THREAD_BASIC_INFORMATION tbi;
+                    if (NT_SUCCESS(pNtQueryInformationThread(hThread, (THREADINFOCLASS)0, &tbi, sizeof(tbi), NULL)))
+                    {
+                        if (!(tbi.AffinityMask & (1ULL << coreIndex)))
+                        {
+                            DWORD_PTR newMask = tbi.AffinityMask | (1ULL << coreIndex);
+                            if (SetThreadAffinityMask(hThread, newMask))
+                            {
+                                LogColor(COLOR_INFO, "     -> [亲和性修正] 将核心 %d 添加到线程亲和性掩码。\n", coreIndex);
+                            }
+                        }
+                    }
+                };
+
+                // --- 执行优化策略 ---
                 if (settings.idealCore >= 0 && pMainThread && pSetThreadSelectedCpuSets && idealCoreCpuSetId != 0)
                 {
-                    // 1. 处理最重负载线程 (pHeavyThread)
-                    if (pHeavyThread && pHeavyThread->smoothedLoad > 10.0) // 只有负载显著时才处理
+                    // 策略 A: 存在重负载辅助线程
+                    if (pHeavyThread && pHeavyThread->smoothedLoad > 10.0)
                     {
-                        // 如果最重负载线程不是 IdealCoreCpuSetId，或者之前分配了其他 ID，则重新设置
+                        // 1. 设置重负载线程 -> IdealCore
                         if (!pHeavyThread->hasCpuSets || pHeavyThread->assignedCpuSetId != idealCoreCpuSetId)
                         {
-                            // 清空之前设置了 CPU Sets 的其他线程 (除了主线程)
+                            // 清理其他线程
                             for (auto& pair : procStats.threads) {
                                 ThreadStats& t = pair.second;
                                 if (t.threadId != pMainThread->threadId && t.hasCpuSets && t.assignedCpuSetId != 0) {
                                     HANDLE hOther = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, t.threadId);
                                     if (hOther) {
-                                        pSetThreadSelectedCpuSets(hOther, NULL, 0); // 清空 CPU Sets
-                                        LogColor(COLOR_DEFAULT, "  -> [优化] 清空线程 %lu 的 CPU Sets (原分配: %lu)。\n", t.threadId, t.assignedCpuSetId);
-                                        t.hasCpuSets = false;
-                                        t.assignedCpuSetId = 0;
+                                        pSetThreadSelectedCpuSets(hOther, NULL, 0);
+                                        t.hasCpuSets = false; t.assignedCpuSetId = 0;
                                         CloseHandle(hOther);
                                     }
                                 }
                             }
 
-                            // 为当前最重负载线程设置 CPU Sets
-                            HANDLE hHeavy = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, pHeavyThread->threadId);
+                            HANDLE hHeavy = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pHeavyThread->threadId);
                             if (hHeavy)
                             {
+                                EnsureCoreInAffinity(hHeavy, settings.idealCore);
                                 ULONG cpuSetIds[] = { idealCoreCpuSetId };
                                 if (pSetThreadSelectedCpuSets(hHeavy, cpuSetIds, 1))
                                 {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 线程 %lu (最重负载) 已绑定 CPU Set ID: %lu (逻辑核: %d)。\n", 
-                                        pHeavyThread->threadId, idealCoreCpuSetId, settings.idealCore);
+                                    LogColor(COLOR_SUCCESS, "  -> [优化] 线程 %lu (重负载) 绑定 CPU Set ID: %lu。\n", pHeavyThread->threadId, idealCoreCpuSetId);
                                     pHeavyThread->hasCpuSets = true;
                                     pHeavyThread->assignedCpuSetId = idealCoreCpuSetId;
                                 }
@@ -989,17 +1043,17 @@ void ThreadOptimizerThread()
                             }
                         }
 
-                        // 2. 处理主线程 (如果最重负载线程不是主线程)
-                        // 将主线程的 CPU Sets 设置为 IdealCore - 2
-                        if (pMainThread->assignedCpuSetId != mainThreadFallbackCpuSetId && mainThreadFallbackCpuSetId != 0)
+                        // 2. 设置主线程 -> IdealCore - 2
+                        if (mainThreadFallbackCpuSetId != 0 && pMainThread->assignedCpuSetId != mainThreadFallbackCpuSetId)
                         {
-                            HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, pMainThread->threadId);
+                            HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pMainThread->threadId);
                             if (hMain)
                             {
+                                EnsureCoreInAffinity(hMain, settings.idealCore - 2);
                                 ULONG cpuSetIds[] = { mainThreadFallbackCpuSetId };
                                 if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1))
                                 {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 已绑定 CPU Set ID: %lu (逻辑核: %d)。\n", 
+                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 绑定 CPU Set ID: %lu (Core %d)。\n",
                                         pMainThread->threadId, mainThreadFallbackCpuSetId, settings.idealCore - 2);
                                     pMainThread->hasCpuSets = true;
                                     pMainThread->assignedCpuSetId = mainThreadFallbackCpuSetId;
@@ -1008,34 +1062,33 @@ void ThreadOptimizerThread()
                             }
                         }
                     }
-                    else // 如果没有显著的重负载非主线程，或者重负载线程就是主线程
+                    // 策略 B: 无重负载辅助线程
+                    else
                     {
-                        // 清空所有非主线程的 CPU Sets
+                        // 清理辅助线程
                         for (auto& pair : procStats.threads) {
                             ThreadStats& t = pair.second;
                             if (t.threadId != pMainThread->threadId && t.hasCpuSets && t.assignedCpuSetId != 0) {
                                 HANDLE hOther = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, t.threadId);
                                 if (hOther) {
-                                    pSetThreadSelectedCpuSets(hOther, NULL, 0); // 清空 CPU Sets
-                                    LogColor(COLOR_DEFAULT, "  -> [优化] 清空线程 %lu 的 CPU Sets (原分配: %lu)。\n", t.threadId, t.assignedCpuSetId);
-                                    t.hasCpuSets = false;
-                                    t.assignedCpuSetId = 0;
+                                    pSetThreadSelectedCpuSets(hOther, NULL, 0);
+                                    t.hasCpuSets = false; t.assignedCpuSetId = 0;
                                     CloseHandle(hOther);
                                 }
                             }
                         }
 
-                        // 将主线程的 CPU Sets 设置为 IdealCore
+                        // 设置主线程 -> IdealCore
                         if (!pMainThread->hasCpuSets || pMainThread->assignedCpuSetId != idealCoreCpuSetId)
                         {
-                            HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, pMainThread->threadId);
+                            HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pMainThread->threadId);
                             if (hMain)
                             {
+                                EnsureCoreInAffinity(hMain, settings.idealCore);
                                 ULONG cpuSetIds[] = { idealCoreCpuSetId };
                                 if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1))
                                 {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 已绑定 CPU Set ID: %lu (逻辑核: %d)。\n", 
-                                        pMainThread->threadId, idealCoreCpuSetId, settings.idealCore);
+                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 绑定 CPU Set ID: %lu。\n", pMainThread->threadId, idealCoreCpuSetId);
                                     pMainThread->hasCpuSets = true;
                                     pMainThread->assignedCpuSetId = idealCoreCpuSetId;
                                 }
@@ -1045,8 +1098,8 @@ void ThreadOptimizerThread()
                     }
                 }
             }
-        } 
-        
+        }
+
         CloseHandle(hSnapshot);
     }
 }
@@ -1056,7 +1109,7 @@ void ProcessListCheckThread()
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::seconds(settings.processListInterval));
-        
+
         // 检查前台是否发生变化
         if (g_foregroundHasChanged.exchange(false))
         {
@@ -1150,11 +1203,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::thread t2(DwmThread);
     std::thread t3(ProcessListCheckThread);
     std::thread t4(ThreadOptimizerThread); // 新增的线程
-    
+
     t1.join();
     t2.join();
     t3.join();
     t4.join(); // 等待新线程
-    
+
     return 0;
 }

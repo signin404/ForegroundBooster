@@ -18,6 +18,7 @@
 #include <atomic>
 #include <mutex>
 #include <cmath>
+#include <condition_variable>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ntdll.lib")
@@ -29,6 +30,8 @@ typedef BOOL(WINAPI* SetThreadSelectedCpuSetsPtr)(HANDLE, const ULONG*, ULONG);
 
 // --- 全局变量新增 ---
 std::mutex g_statsMutex; // 保护缓存的互斥锁
+std::mutex g_cvMutex;
+std::condition_variable g_cvForeground;
 
 struct ThreadStats {
     DWORD threadId;
@@ -503,23 +506,19 @@ void ScanAndResetIoPriorities()
 
 void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime)
 {
-    if (event != EVENT_SYSTEM_FOREGROUND || !hwnd)
-    {
-        return;
-    }
+    if (event != EVENT_SYSTEM_FOREGROUND || !hwnd) return;
 
     DWORD currentProcessId = 0;
     DWORD currentThreadId = 0;
-
     currentThreadId = GetWindowThreadProcessId(hwnd, &currentProcessId);
 
-    if (currentProcessId == 0 || currentProcessId == lastProcessId)
-    {
-        return;
-    }
+    if (currentProcessId == 0 || currentProcessId == lastProcessId) return;
 
+    // 1. 标记变更并唤醒后台线程
     g_foregroundHasChanged = true;
+    g_cvForeground.notify_all(); // 立即唤醒 ThreadOptimizerThread
 
+    // 2. 处理旧进程 (恢复 I/O 优先级 清理 Job Object)
     if (lastProcessId != 0)
     {
         Log("前台进程已变更 (原PID: %lu)\n", lastProcessId);
@@ -591,7 +590,7 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
             DWORD lastError = GetLastError();
             if (lastError == 5)
             {
-                LogColor(COLOR_ERROR, "  -> 失败: 打开进程句柄时被拒绝访问 错误码: 5\n");
+                LogColor(COLOR_ERROR, "  -> 失败: 拒绝访问 错误码: 5\n");
             }
             else
             {
@@ -643,23 +642,15 @@ void CALLBACK ForegroundEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
         {
             if (lastAttachedThreadId != 0)
             {
-                LogColor(COLOR_WARNING, "  -> 正在从旧前台线程 %lu 分离 %zu 个白名单线程...\n", lastAttachedThreadId, threadsToAttach.size());
-                for (DWORD tid : threadsToAttach)
-                {
-                    AttachThreadInput(tid, lastAttachedThreadId, FALSE);
-                }
+                for (DWORD tid : threadsToAttach) AttachThreadInput(tid, lastAttachedThreadId, FALSE);
             }
             std::wstring currentProcessNameLower = to_lower(GetProcessNameById(currentProcessId));
             if (!whiteList.count(currentProcessNameLower))
             {
-                LogColor(COLOR_WARNING, "  -> 正在尝试将 %zu 个白名单线程附加到新前台线程 %lu...\n", threadsToAttach.size(), currentThreadId);
                 int successCount = 0;
                 for (DWORD tid : threadsToAttach)
                 {
-                    if (AttachThreadInput(tid, currentThreadId, TRUE))
-                    {
-                        successCount++;
-                    }
+                    if (AttachThreadInput(tid, currentThreadId, TRUE)) successCount++;
                 }
                 LogColor(COLOR_SUCCESS, "  -> 附加完成: %d / %zu 个线程成功\n", successCount, threadsToAttach.size());
             }
@@ -871,23 +862,17 @@ void ThreadOptimizerThread()
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
 
-    SetThreadSelectedCpuSetsPtr pSetThreadSelectedCpuSets =
-        (SetThreadSelectedCpuSetsPtr)GetProcAddress(hKernel32, "SetThreadSelectedCpuSets");
-    GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation =
-        (GetSystemCpuSetInformationPtr)GetProcAddress(hKernel32, "GetSystemCpuSetInformation");
-    GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets =
-        (GetProcessDefaultCpuSetsPtr)GetProcAddress(hKernel32, "GetProcessDefaultCpuSets");
-    NtQueryInformationThreadPtr pNtQueryInformationThread =
-        (NtQueryInformationThreadPtr)GetProcAddress(hNtdll, "NtQueryInformationThread");
+    SetThreadSelectedCpuSetsPtr pSetThreadSelectedCpuSets = (SetThreadSelectedCpuSetsPtr)GetProcAddress(hKernel32, "SetThreadSelectedCpuSets");
+    GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation = (GetSystemCpuSetInformationPtr)GetProcAddress(hKernel32, "GetSystemCpuSetInformation");
+    GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets = (GetProcessDefaultCpuSetsPtr)GetProcAddress(hKernel32, "GetProcessDefaultCpuSets");
+    NtQueryInformationThreadPtr pNtQueryInformationThread = (NtQueryInformationThreadPtr)GetProcAddress(hNtdll, "NtQueryInformationThread");
 
-    if (!pSetThreadSelectedCpuSets || !pGetSystemCpuSetInformation)
-    {
+    if (!pSetThreadSelectedCpuSets || !pGetSystemCpuSetInformation) {
         LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+) 优化功能受限\n");
     }
 
     ULONG idealCoreCpuSetId = 0;
     ULONG mainThreadFallbackCpuSetId = 0;
-
     if (settings.idealCore >= 0 && pGetSystemCpuSetInformation) {
         idealCoreCpuSetId = GetCpuSetIdFromLogicalIndex((DWORD)settings.idealCore, pGetSystemCpuSetInformation);
         if (settings.idealCore >= 2) {
@@ -898,71 +883,85 @@ void ThreadOptimizerThread()
     CpuTopology topology;
     DWORD previousPid = 0;
 
+    // Lambda: 检查黑名单和亲和性
+    auto CheckProcessRestrictions = [&](DWORD pid) -> bool {
+        std::wstring name = GetProcessNameById(pid);
+        if (blackList.count(to_lower(name))) {
+            LogColor(COLOR_WARNING, "[监控] 进程 %lu (%ws) 在黑名单中 跳过\n", pid, name.c_str());
+            std::lock_guard<std::mutex> lock(g_statsMutex);
+            if (g_processStatsCache.count(pid)) g_processStatsCache.erase(pid);
+            return true;
+        }
+        bool customConfigDetected = false;
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProcess) {
+            DWORD_PTR processAffinity, systemAffinity;
+            if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity)) {
+                if (processAffinity != systemAffinity) customConfigDetected = true;
+            }
+            if (!customConfigDetected && pGetProcessDefaultCpuSets) {
+                ULONG requiredIdCount = 0;
+                pGetProcessDefaultCpuSets(hProcess, NULL, 0, &requiredIdCount);
+                if (requiredIdCount > 0) customConfigDetected = true;
+            }
+            CloseHandle(hProcess);
+        }
+        if (customConfigDetected) {
+            std::lock_guard<std::mutex> lock(g_statsMutex);
+            ProcessStats& procStats = g_processStatsCache[pid];
+            procStats.processId = pid;
+            if (!procStats.ignoreMonitoring) {
+                procStats.ignoreMonitoring = true;
+                procStats.threads.clear();
+                LogColor(COLOR_WARNING, "  -> [监控停止] 进程 %lu 已设置亲和性或 CPU Sets\n", pid);
+            }
+            return true;
+        }
+        return false;
+    };
+
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // 智能等待：1秒心跳 或 被前台事件唤醒
+        std::unique_lock<std::mutex> cvLock(g_cvMutex);
+        g_cvForeground.wait_for(cvLock, std::chrono::seconds(1));
+        cvLock.unlock();
 
-        // --- 新增：主开关检查 ---
-        // 如果未设置 IdealCore 则视为禁用所有 CPU 优化功能
-        // 跳过后续的拓扑分析、监控、日志和计算 仅保持线程存活
-        if (settings.idealCore < 0)
-        {
-            continue;
-        }
-        // -----------------------
+        if (settings.idealCore < 0) continue;
 
         DWORD currentPid = lastProcessId;
-
-        // --- 修正点 1: 在循环顶部统一定义时间变量 ---
         FILETIME ftSystem;
         GetSystemTimeAsFileTime(&ftSystem);
         ULARGE_INTEGER now = FT2ULL(ftSystem);
-        // -------------------------------------------
 
         // --- 后台进程清理逻辑 ---
         if (settings.cpuSetResetInterval > 0 && pSetThreadSelectedCpuSets)
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             ULONGLONG resetThreshold = (ULONGLONG)settings.cpuSetResetInterval * 10000000ULL;
-
-            for (auto& procPair : g_processStatsCache)
-            {
+            for (auto& procPair : g_processStatsCache) {
                 DWORD pid = procPair.first;
                 ProcessStats& pStats = procPair.second;
-
-                if (pid == currentPid)
-                {
+                if (pid == currentPid) {
                     pStats.lastForegroundTime = now;
                     continue;
                 }
-
-                if (pStats.lastForegroundTime.QuadPart > 0 && now.QuadPart > pStats.lastForegroundTime.QuadPart)
-                {
-                    ULONGLONG timeInBg = now.QuadPart - pStats.lastForegroundTime.QuadPart;
-
-                    if (timeInBg > resetThreshold)
-                    {
+                if (pStats.lastForegroundTime.QuadPart > 0 && now.QuadPart > pStats.lastForegroundTime.QuadPart) {
+                    if ((now.QuadPart - pStats.lastForegroundTime.QuadPart) > resetThreshold) {
                         bool anyReset = false;
-                        for (auto& threadPair : pStats.threads)
-                        {
+                        for (auto& threadPair : pStats.threads) {
                             ThreadStats& tStats = threadPair.second;
-                            if (tStats.hasCpuSets)
-                            {
+                            if (tStats.hasCpuSets) {
                                 HANDLE hThread = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, tStats.threadId);
-                                if (hThread)
-                                {
+                                if (hThread) {
                                     if (pSetThreadSelectedCpuSets(hThread, NULL, 0)) anyReset = true;
                                     CloseHandle(hThread);
                                 }
-                                tStats.hasCpuSets = false;
-                                tStats.assignedCpuSetId = 0;
+                                tStats.hasCpuSets = false; tStats.assignedCpuSetId = 0;
                             }
                         }
-
-                        if (anyReset)
-                        {
-                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 在后台超过 %d 秒 重置其线程 CPU Sets\n",
-                                pid, settings.cpuSetResetInterval);
+                        if (anyReset) {
+                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 后台超时 已重置 CPU Sets\n", pid);
                             pStats.lastForegroundTime = now;
                         }
                     }
@@ -972,86 +971,64 @@ void ThreadOptimizerThread()
 
         if (currentPid == 0) continue;
 
-        // --- 新增：黑名单检查 (带缓存) ---
-        static DWORD lastCheckedBlacklistPid = 0;
-        static bool isBlacklisted = false;
+        // --- 核心逻辑 ---
+        bool needSnapshot = false;
+        bool isImmediateRun = false;
 
-        if (currentPid != lastCheckedBlacklistPid)
-        {
-            std::wstring name = GetProcessNameById(currentPid);
-            // 转换为小写并检查是否在黑名单中
-            if (blackList.count(to_lower(name)))
-            {
-                isBlacklisted = true;
-                LogColor(COLOR_WARNING, "[监控] 进程 %lu (%ws) 在黑名单中 跳过 CPU 优化\n", currentPid, name.c_str());
-
-                // 如果缓存中有该进程的数据 清除它
-                std::lock_guard<std::mutex> lock(g_statsMutex);
-                if (g_processStatsCache.count(currentPid))
-                {
-                    g_processStatsCache.erase(currentPid);
-                }
+        // 1. 检查限制 (仅在切换时)
+        if (currentPid != previousPid) {
+            if (CheckProcessRestrictions(currentPid)) {
+                previousPid = currentPid;
+                continue;
             }
-            else
-            {
-                isBlacklisted = false;
-            }
-            lastCheckedBlacklistPid = currentPid;
         }
 
-        if (isBlacklisted)
-        {
-            continue; // 直接跳过后续所有逻辑 (快照、计算、优化)
-        }
-
-        // --- 快速检查：是否忽略 ---
+        // 2. 检查忽略标记
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
-            if (g_processStatsCache.count(currentPid) && g_processStatsCache[currentPid].ignoreMonitoring) continue;
+            if (g_processStatsCache.count(currentPid) && g_processStatsCache[currentPid].ignoreMonitoring) {
+                previousPid = currentPid;
+                continue;
+            }
         }
 
-        // --- 亲和性与 CPU Sets 检查 ---
-        bool customConfigDetected = false;
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, currentPid);
-        if (hProcess)
-        {
-            DWORD_PTR processAffinity, systemAffinity;
-            if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity))
-            {
-                if (processAffinity != systemAffinity) customConfigDetected = true;
-            }
-
-            if (!customConfigDetected && pGetProcessDefaultCpuSets)
-            {
-                ULONG requiredIdCount = 0;
-                pGetProcessDefaultCpuSets(hProcess, NULL, 0, &requiredIdCount);
-                if (requiredIdCount > 0) customConfigDetected = true;
-            }
-            CloseHandle(hProcess);
-        }
-
-        if (customConfigDetected)
+        // 3. 决策逻辑
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             ProcessStats& procStats = g_processStatsCache[currentPid];
             procStats.processId = currentPid;
-            if (!procStats.ignoreMonitoring)
-            {
-                procStats.ignoreMonitoring = true;
-                procStats.threads.clear();
-                LogColor(COLOR_WARNING, "  -> [监控停止] 进程 %lu 已设置亲和性或 CPU Sets 停止追踪其线程负载\n", currentPid);
+            procStats.lastForegroundTime = now;
+
+            if (currentPid != previousPid) {
+                if (procStats.lastOptimizationTime.QuadPart == 0) {
+                    LogColor(COLOR_INFO, "[监控] 新进程 %lu 立即采样并优化\n", currentPid);
+                    isImmediateRun = true;
+                    needSnapshot = true;
+                } else {
+                    LogColor(COLOR_INFO, "[监控] 旧进程 %lu 等待周期结束 (%d 秒后)\n", currentPid, settings.cpuSetInterval);
+                    procStats.lastOptimizationTime = now;
+                }
+                previousPid = currentPid;
+            } else {
+                ULONGLONG timeSinceLastOpt = now.QuadPart - procStats.lastOptimizationTime.QuadPart;
+                ULONGLONG intervalUnits = (ULONGLONG)settings.cpuSetInterval * 10000000ULL;
+                if (timeSinceLastOpt >= intervalUnits) {
+                    // 再次检查限制 (防止中途修改)
+                    lock.unlock();
+                    bool restricted = CheckProcessRestrictions(currentPid);
+                    lock.lock();
+                    if (restricted) continue;
+
+                    LogColor(COLOR_INFO, "[分析] 观察周期结束 执行采样与计算...\n");
+                    needSnapshot = true;
+                }
             }
-            continue;
         }
 
-        // --- 在循环内部初始化拓扑 (仅一次) ---
-        if (!topology.isInitialized && pGetSystemCpuSetInformation) {
-            AnalyzeCpuTopology(pGetSystemCpuSetInformation, topology);
-        }
+        if (!needSnapshot) continue;
 
-        // --- 修正点 2: 删除了此处重复定义的 ftSystem 和 now ---
-        // (原代码这里有重复定义 导致编译错误)
-        // ---------------------------------------------------
+        // --- 执行快照与计算 ---
+        if (!topology.isInitialized && pGetSystemCpuSetInformation) AnalyzeCpuTopology(pGetSystemCpuSetInformation, topology);
 
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) continue;
@@ -1063,331 +1040,206 @@ void ThreadOptimizerThread()
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             ProcessStats& procStats = g_processStatsCache[currentPid];
-            procStats.processId = currentPid;
 
-            // 再次更新前台时间 防止清理逻辑误判 (双重保险)
-            procStats.lastForegroundTime = now;
-
-            // --- 检测前台切换 ---
-            if (currentPid != previousPid)
-            {
-                if (procStats.lastOptimizationTime.QuadPart == 0)
-                {
-                    LogColor(COLOR_INFO, "[监控] 新进程 %lu 将立即执行首次优化\n", currentPid);
-                }
-                else
-                {
-                    LogColor(COLOR_INFO, "[监控] 旧进程 %lu 将在 %d 秒后应用优化\n", currentPid, settings.cpuSetInterval);
-                    procStats.lastOptimizationTime = now;
-                    for (auto& pair : procStats.threads) {
-                        pair.second.intervalStartTime = now;
-                        pair.second.intervalStartKernelTime = pair.second.lastKernelTime;
-                        pair.second.intervalStartUserTime = pair.second.lastUserTime;
-                    }
-                }
-                previousPid = currentPid;
-            }
-
-            // --- 更新线程列表与快照 ---
-            if (Thread32First(hSnapshot, &te32))
-            {
-                do
-                {
-                    if (te32.th32OwnerProcessID == currentPid)
-                    {
+            if (Thread32First(hSnapshot, &te32)) {
+                do {
+                    if (te32.th32OwnerProcessID == currentPid) {
                         DWORD tid = te32.th32ThreadID;
                         currentThreadIds.push_back(tid);
-
-                        bool isNewThread = (procStats.threads.find(tid) == procStats.threads.end());
-
-                        if (isNewThread)
-                        {
-                            ThreadStats ts = {};
+                        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+                        if (hThread) {
+                            ThreadStats& ts = procStats.threads[tid];
                             ts.threadId = tid;
-                            ts.hasCpuSets = false;
-                            ts.assignedCpuSetId = 0;
-
-                            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
-                            if (hThread)
-                            {
-                                FILETIME ftExit, ftKernel, ftUser;
-                                if (GetThreadTimes(hThread, &ts.creationTime, &ftExit, &ftKernel, &ftUser))
-                                {
-                                    ts.lastKernelTime = FT2ULL(ftKernel);
-                                    ts.lastUserTime = FT2ULL(ftUser);
-                                    ts.lastCheckTime = now;
-                                    ts.intervalStartKernelTime = ts.lastKernelTime;
-                                    ts.intervalStartUserTime = ts.lastUserTime;
+                            FILETIME ftCreation, ftExit, ftKernel, ftUser;
+                            if (GetThreadTimes(hThread, &ts.creationTime, &ftExit, &ftKernel, &ftUser)) {
+                                ULARGE_INTEGER k = FT2ULL(ftKernel);
+                                ULARGE_INTEGER u = FT2ULL(ftUser);
+                                if (isImmediateRun) {
+                                    ts.intervalAverageLoad = 0.0;
+                                    ts.intervalStartKernelTime = k;
+                                    ts.intervalStartUserTime = u;
+                                    ts.intervalStartTime = now;
+                                } else {
+                                    if (ts.intervalStartTime.QuadPart > 0) {
+                                        ULONGLONG timeDelta = now.QuadPart - ts.intervalStartTime.QuadPart;
+                                        ULONGLONG workDelta = (k.QuadPart - ts.intervalStartKernelTime.QuadPart) + (u.QuadPart - ts.intervalStartUserTime.QuadPart);
+                                        ts.intervalAverageLoad = (timeDelta > 0) ? ((double)workDelta / (double)timeDelta * 100.0) : 0.0;
+                                    } else {
+                                        ts.intervalAverageLoad = 0.0;
+                                    }
+                                    ts.intervalStartKernelTime = k;
+                                    ts.intervalStartUserTime = u;
                                     ts.intervalStartTime = now;
                                 }
-                                CloseHandle(hThread);
                             }
-                            procStats.threads[tid] = ts;
-                        }
-                        else
-                        {
-                            ThreadStats& ts = procStats.threads[tid];
-                            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
-                            if (hThread)
-                            {
-                                FILETIME ftCreation, ftExit, ftKernel, ftUser;
-                                if (GetThreadTimes(hThread, &ftCreation, &ftExit, &ftKernel, &ftUser))
-                                {
-                                    ts.lastKernelTime = FT2ULL(ftKernel);
-                                    ts.lastUserTime = FT2ULL(ftUser);
-                                    ts.lastCheckTime = now;
-
-                                    if (procStats.lastOptimizationTime.QuadPart != 0 &&
-                                        ts.intervalStartTime.QuadPart != procStats.lastOptimizationTime.QuadPart)
-                                    {
-                                        ts.intervalStartKernelTime = ts.lastKernelTime;
-                                        ts.intervalStartUserTime = ts.lastUserTime;
-                                        ts.intervalStartTime = now;
-                                    }
-                                }
-                                CloseHandle(hThread);
-                            }
+                            CloseHandle(hThread);
                         }
                     }
                 } while (Thread32Next(hSnapshot, &te32));
             }
 
-            for (auto it = procStats.threads.begin(); it != procStats.threads.end(); )
-            {
+            for (auto it = procStats.threads.begin(); it != procStats.threads.end(); ) {
                 bool exists = false;
-                for (DWORD activeTid : currentThreadIds) {
-                    if (activeTid == it->first) { exists = true; break; }
-                }
-                if (!exists) it = procStats.threads.erase(it);
-                else ++it;
+                for (DWORD activeTid : currentThreadIds) { if (activeTid == it->first) { exists = true; break; } }
+                if (!exists) it = procStats.threads.erase(it); else ++it;
             }
 
-            ULONGLONG timeSinceLastOpt = now.QuadPart - procStats.lastOptimizationTime.QuadPart;
-            ULONGLONG intervalUnits = (ULONGLONG)settings.cpuSetInterval * 10000000ULL;
+            procStats.lastOptimizationTime = now;
 
-            if (timeSinceLastOpt >= intervalUnits)
-            {
-                bool isImmediateRun = (procStats.lastOptimizationTime.QuadPart == 0);
-                if (isImmediateRun) {
-                    LogColor(COLOR_INFO, "[分析] 触发新进程立即优化...\n");
-                } else {
-                    LogColor(COLOR_INFO, "[分析] 观察周期结束 正在计算平均负载并应用优化...\n");
-                }
+            // --- 识别与应用策略 ---
+            ThreadStats* pMainThread = nullptr;
+            ThreadStats* pHeavyThread = nullptr;
 
-                for (auto& pair : procStats.threads)
-                {
-                    ThreadStats& ts = pair.second;
-                    if (isImmediateRun) {
-                        ts.intervalAverageLoad = 0.0;
-                        continue;
-                    }
-                    ULONGLONG timeDelta = now.QuadPart - ts.intervalStartTime.QuadPart;
-                    ULONGLONG workDelta = (ts.lastKernelTime.QuadPart - ts.intervalStartKernelTime.QuadPart) +
-                                          (ts.lastUserTime.QuadPart - ts.intervalStartUserTime.QuadPart);
-                    if (timeDelta > 0) ts.intervalAverageLoad = (double)workDelta / (double)timeDelta * 100.0;
-                    else ts.intervalAverageLoad = 0.0;
-                    ts.intervalStartKernelTime = ts.lastKernelTime;
-                    ts.intervalStartUserTime = ts.lastUserTime;
-                    ts.intervalStartTime = now;
-                }
-
-                procStats.lastOptimizationTime = now;
-
-                ThreadStats* pMainThread = nullptr;
-                ThreadStats* pHeavyThread = nullptr;
-
-                for (auto& pair : procStats.threads)
-                {
+            for (auto& pair : procStats.threads) {
+                ThreadStats& t = pair.second;
+                if (pMainThread == nullptr || CompareFileTime(&t.creationTime, &pMainThread->creationTime) < 0) pMainThread = &t;
+            }
+            if (!isImmediateRun) {
+                for (auto& pair : procStats.threads) {
                     ThreadStats& t = pair.second;
-                    if (pMainThread == nullptr || CompareFileTime(&t.creationTime, &pMainThread->creationTime) < 0)
-                        pMainThread = &t;
-                }
-
-                if (!isImmediateRun)
-                {
-                    for (auto& pair : procStats.threads)
-                    {
-                        ThreadStats& t = pair.second;
-                        if (pMainThread && t.threadId != pMainThread->threadId)
-                        {
-                            if (pHeavyThread == nullptr || t.intervalAverageLoad > pHeavyThread->intervalAverageLoad)
-                                pHeavyThread = &t;
-                        }
+                    if (pMainThread && t.threadId != pMainThread->threadId) {
+                        if (pHeavyThread == nullptr || t.intervalAverageLoad > pHeavyThread->intervalAverageLoad) pHeavyThread = &t;
                     }
                 }
+            }
+            if (pMainThread) pMainThread->isMainThread = true;
 
-                if (pMainThread) pMainThread->isMainThread = true;
-
-                auto EnsureCoreInAffinity = [&](HANDLE hThread, DWORD coreIndex) {
-                    if (!pNtQueryInformationThread) return;
-                    THREAD_BASIC_INFORMATION tbi;
-                    if (NT_SUCCESS(pNtQueryInformationThread(hThread, (THREADINFOCLASS)0, &tbi, sizeof(tbi), NULL)))
-                    {
-                        if (!(tbi.AffinityMask & (1ULL << coreIndex)))
-                        {
-                            DWORD_PTR newMask = tbi.AffinityMask | (1ULL << coreIndex);
-                            SetThreadAffinityMask(hThread, newMask);
-                        }
+            auto EnsureCoreInAffinity = [&](HANDLE hThread, DWORD coreIndex) {
+                if (!pNtQueryInformationThread) return;
+                THREAD_BASIC_INFORMATION tbi;
+                if (NT_SUCCESS(pNtQueryInformationThread(hThread, (THREADINFOCLASS)0, &tbi, sizeof(tbi), NULL))) {
+                    if (!(tbi.AffinityMask & (1ULL << coreIndex))) {
+                        DWORD_PTR newMask = tbi.AffinityMask | (1ULL << coreIndex);
+                        SetThreadAffinityMask(hThread, newMask);
                     }
-                };
+                }
+            };
 
-                if (settings.idealCore >= 0 && pMainThread && pSetThreadSelectedCpuSets && idealCoreCpuSetId != 0)
+            if (settings.idealCore >= 0 && pMainThread && pSetThreadSelectedCpuSets && idealCoreCpuSetId != 0)
+            {
+                DWORD assignedMainCore = settings.idealCore;
+                DWORD assignedHeavyCore = settings.idealCore;
+
+                if (pHeavyThread && pHeavyThread->intervalAverageLoad > 10.0)
                 {
-                    DWORD assignedMainCore = settings.idealCore;
-                    DWORD assignedHeavyCore = settings.idealCore;
+                    LogColor(COLOR_INFO, "  -> 检测到重负载线程 %lu (平均负载 %.1f%%) 执行分离策略\n", pHeavyThread->threadId, pHeavyThread->intervalAverageLoad);
 
-                    if (pHeavyThread && pHeavyThread->intervalAverageLoad > 10.0)
-                    {
-                        LogColor(COLOR_INFO, "  -> 检测到重负载线程 %lu (平均负载 %.1f%%) 执行分离策略\n",
-                            pHeavyThread->threadId, pHeavyThread->intervalAverageLoad);
-
-                        if (!pHeavyThread->hasCpuSets || pHeavyThread->assignedCpuSetId != idealCoreCpuSetId)
-                        {
-                            for (auto& pair : procStats.threads) {
-                                ThreadStats& t = pair.second;
-                                if (t.threadId != pMainThread->threadId && t.hasCpuSets && t.assignedCpuSetId != 0) {
-                                    HANDLE hOther = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, t.threadId);
-                                    if (hOther) {
-                                        pSetThreadSelectedCpuSets(hOther, NULL, 0);
-                                        t.hasCpuSets = false; t.assignedCpuSetId = 0;
-                                        CloseHandle(hOther);
-                                    }
-                                }
-                            }
-
-                            HANDLE hHeavy = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pHeavyThread->threadId);
-                            if (hHeavy)
-                            {
-                                EnsureCoreInAffinity(hHeavy, settings.idealCore);
-                                ULONG cpuSetIds[] = { idealCoreCpuSetId };
-                                if (pSetThreadSelectedCpuSets(hHeavy, cpuSetIds, 1))
-                                {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 线程 %lu (重负载) 绑定 CPU Set ID: %lu\n", pHeavyThread->threadId, idealCoreCpuSetId);
-                                    pHeavyThread->hasCpuSets = true;
-                                    pHeavyThread->assignedCpuSetId = idealCoreCpuSetId;
-                                }
-                                CloseHandle(hHeavy);
-                            }
-                        }
-
-                        if (mainThreadFallbackCpuSetId != 0 && pMainThread->assignedCpuSetId != mainThreadFallbackCpuSetId)
-                        {
-                            HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pMainThread->threadId);
-                            if (hMain)
-                            {
-                                EnsureCoreInAffinity(hMain, settings.idealCore - 2);
-                                ULONG cpuSetIds[] = { mainThreadFallbackCpuSetId };
-                                if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1))
-                                {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 绑定 CPU Set ID: %lu (Core %d)\n",
-                                        pMainThread->threadId, mainThreadFallbackCpuSetId, settings.idealCore - 2);
-                                    pMainThread->hasCpuSets = true;
-                                    pMainThread->assignedCpuSetId = mainThreadFallbackCpuSetId;
-                                }
-                                CloseHandle(hMain);
-                            }
-                        }
-                        assignedHeavyCore = settings.idealCore;
-                        assignedMainCore = settings.idealCore - 2;
-                    }
-                    else
-                    {
+                    if (!pHeavyThread->hasCpuSets || pHeavyThread->assignedCpuSetId != idealCoreCpuSetId) {
                         for (auto& pair : procStats.threads) {
                             ThreadStats& t = pair.second;
                             if (t.threadId != pMainThread->threadId && t.hasCpuSets && t.assignedCpuSetId != 0) {
                                 HANDLE hOther = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, t.threadId);
-                                if (hOther) {
-                                    pSetThreadSelectedCpuSets(hOther, NULL, 0);
-                                    t.hasCpuSets = false; t.assignedCpuSetId = 0;
-                                    CloseHandle(hOther);
-                                }
+                                if (hOther) { pSetThreadSelectedCpuSets(hOther, NULL, 0); CloseHandle(hOther); }
+                                t.hasCpuSets = false; t.assignedCpuSetId = 0;
                             }
                         }
-
-                        if (!pMainThread->hasCpuSets || pMainThread->assignedCpuSetId != idealCoreCpuSetId)
-                        {
-                            HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pMainThread->threadId);
-                            if (hMain)
-                            {
-                                EnsureCoreInAffinity(hMain, settings.idealCore);
-                                ULONG cpuSetIds[] = { idealCoreCpuSetId };
-                                if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1))
-                                {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 绑定 CPU Set ID: %lu\n", pMainThread->threadId, idealCoreCpuSetId);
-                                    pMainThread->hasCpuSets = true;
-                                    pMainThread->assignedCpuSetId = idealCoreCpuSetId;
-                                }
-                                CloseHandle(hMain);
+                        HANDLE hHeavy = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pHeavyThread->threadId);
+                        if (hHeavy) {
+                            EnsureCoreInAffinity(hHeavy, settings.idealCore);
+                            ULONG cpuSetIds[] = { idealCoreCpuSetId };
+                            if (pSetThreadSelectedCpuSets(hHeavy, cpuSetIds, 1)) {
+                                LogColor(COLOR_SUCCESS, "  -> [优化] 线程 %lu (重负载) 绑定 CPU Set ID: %lu\n", pHeavyThread->threadId, idealCoreCpuSetId);
+                                pHeavyThread->hasCpuSets = true; pHeavyThread->assignedCpuSetId = idealCoreCpuSetId;
                             }
+                            CloseHandle(hHeavy);
                         }
-                        assignedMainCore = settings.idealCore;
-                        assignedHeavyCore = settings.idealCore;
                     }
 
-                    if (settings.optimizeOtherThreads && topology.isInitialized && !isImmediateRun)
-                    {
-                        std::vector<ThreadStats*> otherThreads;
-                        for (auto& pair : procStats.threads) {
-                            ThreadStats* t = &pair.second;
-                            if (t->threadId == pMainThread->threadId) continue;
-                            if (pHeavyThread && t->threadId == pHeavyThread->threadId) continue;
-                            otherThreads.push_back(t);
+                    if (mainThreadFallbackCpuSetId != 0 && pMainThread->assignedCpuSetId != mainThreadFallbackCpuSetId) {
+                        HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pMainThread->threadId);
+                        if (hMain) {
+                            EnsureCoreInAffinity(hMain, settings.idealCore - 2);
+                            ULONG cpuSetIds[] = { mainThreadFallbackCpuSetId };
+                            if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1)) {
+                                LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 绑定 CPU Set ID: %lu (Core %d)\n", pMainThread->threadId, mainThreadFallbackCpuSetId, settings.idealCore - 2);
+                                pMainThread->hasCpuSets = true; pMainThread->assignedCpuSetId = mainThreadFallbackCpuSetId;
+                            }
+                            CloseHandle(hMain);
                         }
-                        std::sort(otherThreads.begin(), otherThreads.end(), [](ThreadStats* a, ThreadStats* b) {
-                            return a->intervalAverageLoad > b->intervalAverageLoad;
-                        });
-
-                        if (!otherThreads.empty())
-                        {
-                            std::vector<DWORD> allocationQueue;
-                            for (DWORD core : topology.pCores) {
-                                if (core == assignedMainCore || core == assignedHeavyCore) continue;
-                                allocationQueue.push_back(core);
+                    }
+                    assignedHeavyCore = settings.idealCore;
+                    assignedMainCore = settings.idealCore - 2;
+                }
+                else
+                {
+                    for (auto& pair : procStats.threads) {
+                        ThreadStats& t = pair.second;
+                        if (t.threadId != pMainThread->threadId && t.hasCpuSets && t.assignedCpuSetId != 0) {
+                            HANDLE hOther = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, t.threadId);
+                            if (hOther) { pSetThreadSelectedCpuSets(hOther, NULL, 0); CloseHandle(hOther); }
+                            t.hasCpuSets = false; t.assignedCpuSetId = 0;
+                        }
+                    }
+                    if (!pMainThread->hasCpuSets || pMainThread->assignedCpuSetId != idealCoreCpuSetId) {
+                        HANDLE hMain = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, pMainThread->threadId);
+                        if (hMain) {
+                            EnsureCoreInAffinity(hMain, settings.idealCore);
+                            ULONG cpuSetIds[] = { idealCoreCpuSetId };
+                            if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1)) {
+                                LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 绑定 CPU Set ID: %lu\n", pMainThread->threadId, idealCoreCpuSetId);
+                                pMainThread->hasCpuSets = true; pMainThread->assignedCpuSetId = idealCoreCpuSetId;
                             }
+                            CloseHandle(hMain);
+                        }
+                    }
+                    assignedMainCore = settings.idealCore;
+                    assignedHeavyCore = settings.idealCore;
+                }
 
-                            std::vector<DWORD> htQueue;
-                            DWORD mainHT = -1;
-                            DWORD heavyHT = -1;
-                            DWORD mainCoreIndex = topology.lpToCoreIndex.count(assignedMainCore) ? topology.lpToCoreIndex[assignedMainCore] : -1;
-                            DWORD heavyCoreIndex = topology.lpToCoreIndex.count(assignedHeavyCore) ? topology.lpToCoreIndex[assignedHeavyCore] : -1;
+                // 其余线程优化
+                if (settings.optimizeOtherThreads && topology.isInitialized && !isImmediateRun)
+                {
+                    std::vector<ThreadStats*> otherThreads;
+                    for (auto& pair : procStats.threads) {
+                        ThreadStats* t = &pair.second;
+                        if (t->threadId == pMainThread->threadId) continue;
+                        if (pHeavyThread && t->threadId == pHeavyThread->threadId) continue;
+                        otherThreads.push_back(t);
+                    }
+                    std::sort(otherThreads.begin(), otherThreads.end(), [](ThreadStats* a, ThreadStats* b) {
+                        return a->intervalAverageLoad > b->intervalAverageLoad;
+                    });
 
-                            for (DWORD core : topology.htCores) {
-                                DWORD coreIndex = topology.lpToCoreIndex[core];
-                                if (coreIndex == mainCoreIndex) mainHT = core;
-                                else if (coreIndex == heavyCoreIndex) heavyHT = core;
-                                else htQueue.push_back(core);
-                            }
+                    if (!otherThreads.empty())
+                    {
+                        std::vector<DWORD> allocationQueue;
+                        for (DWORD core : topology.pCores) {
+                            if (core == assignedMainCore || core == assignedHeavyCore) continue;
+                            allocationQueue.push_back(core);
+                        }
+                        std::vector<DWORD> htQueue;
+                        DWORD mainHT = -1, heavyHT = -1;
+                        DWORD mainCoreIndex = topology.lpToCoreIndex.count(assignedMainCore) ? topology.lpToCoreIndex[assignedMainCore] : -1;
+                        DWORD heavyCoreIndex = topology.lpToCoreIndex.count(assignedHeavyCore) ? topology.lpToCoreIndex[assignedHeavyCore] : -1;
+                        for (DWORD core : topology.htCores) {
+                            DWORD coreIndex = topology.lpToCoreIndex[core];
+                            if (coreIndex == mainCoreIndex) mainHT = core;
+                            else if (coreIndex == heavyCoreIndex) heavyHT = core;
+                            else htQueue.push_back(core);
+                        }
+                        std::sort(htQueue.rbegin(), htQueue.rend());
+                        allocationQueue.insert(allocationQueue.end(), htQueue.begin(), htQueue.end());
+                        if (mainHT != -1) allocationQueue.push_back(mainHT);
+                        if (heavyHT != -1 && heavyHT != mainHT) allocationQueue.push_back(heavyHT);
+                        allocationQueue.insert(allocationQueue.end(), topology.eCores.begin(), topology.eCores.end());
 
-                            std::sort(htQueue.rbegin(), htQueue.rend());
-                            allocationQueue.insert(allocationQueue.end(), htQueue.begin(), htQueue.end());
-
-                            if (mainHT != -1) allocationQueue.push_back(mainHT);
-                            if (heavyHT != -1 && heavyHT != mainHT) allocationQueue.push_back(heavyHT);
-
-                            allocationQueue.insert(allocationQueue.end(), topology.eCores.begin(), topology.eCores.end());
-
-                            if (!allocationQueue.empty())
-                            {
-                                LogColor(COLOR_INFO, "  -> [其余线程] 正在为 %zu 个线程分配理想核心 (队列长度: %zu)...\n", otherThreads.size(), allocationQueue.size());
-                                int successCount = 0;
-                                for (size_t i = 0; i < otherThreads.size(); ++i) {
-                                    DWORD targetCore = allocationQueue[i % allocationQueue.size()];
-                                    HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, otherThreads[i]->threadId);
-                                    if (hThread) {
-                                        if (SetThreadIdealProcessor(hThread, targetCore) != (DWORD)-1) {
-                                            successCount++;
-                                        }
-                                        CloseHandle(hThread);
-                                    }
+                        if (!allocationQueue.empty()) {
+                            LogColor(COLOR_INFO, "  -> [其余线程] 正在为 %zu 个线程分配理想核心 (队列长度: %zu)...\n", otherThreads.size(), allocationQueue.size());
+                            int successCount = 0;
+                            for (size_t i = 0; i < otherThreads.size(); ++i) {
+                                DWORD targetCore = allocationQueue[i % allocationQueue.size()];
+                                HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, otherThreads[i]->threadId);
+                                if (hThread) {
+                                    if (SetThreadIdealProcessor(hThread, targetCore) != (DWORD)-1) successCount++;
+                                    CloseHandle(hThread);
                                 }
-                                LogColor(COLOR_SUCCESS, "     -> 已设置 %d / %zu 个线程的理想核心\n", successCount, otherThreads.size());
                             }
+                            LogColor(COLOR_SUCCESS, "     -> 已设置 %d / %zu 个线程的理想核心\n", successCount, otherThreads.size());
                         }
                     }
                 }
             }
         }
-
         CloseHandle(hSnapshot);
     }
 }

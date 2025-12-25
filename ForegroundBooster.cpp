@@ -107,7 +107,7 @@ struct Settings
     int dscp = -1;
     int scheduling = -1;
     int weight = -1;
-    int processListInterval = 60;
+    int ioResetInterval = 60;
     int idealCore = -1;
     int cpuSetInterval = 600;
     bool optimizeOtherThreads = false;
@@ -261,7 +261,7 @@ void ParseIniFile(const std::wstring& path)
                     else if (key == L"DSCP") settings.dscp = std::stoi(value);
                     else if (key == L"Scheduling") settings.scheduling = std::stoi(value);
                     else if (key == L"Weight") settings.weight = std::stoi(value);
-                    else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
+                    else if (key == L"IOReset") settings.ioResetInterval = std::stoi(value);
                     else if (key == L"IdealCore") settings.idealCore = std::stoi(value);
 					else if (key == L"CpuSetInterval") settings.cpuSetInterval = std::stoi(value);
 					else if (key == L"OptimizeOtherThreads") settings.optimizeOtherThreads = (std::stoi(value) != 0);
@@ -902,6 +902,15 @@ void ThreadOptimizerThread()
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
+        // --- 新增：主开关检查 ---
+        // 如果未设置 IdealCore 则视为禁用所有 CPU 优化功能
+        // 跳过后续的拓扑分析、监控、日志和计算 仅保持线程存活
+        if (settings.idealCore < 0)
+        {
+            continue;
+        }
+        // -----------------------
+
         DWORD currentPid = lastProcessId;
 
         // --- 修正点 1: 在循环顶部统一定义时间变量 ---
@@ -1355,7 +1364,7 @@ void ProcessListCheckThread()
 {
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(settings.processListInterval));
+        std::this_thread::sleep_for(std::chrono::seconds(settings.ioResetInterval));
 
         // 检查前台是否发生变化
         if (g_foregroundHasChanged.exchange(false))

@@ -734,38 +734,6 @@ void EventMessageLoopThread()
 }
 
 // --- 新增：CPU Sets API 定义与辅助函数 ---
-
-// 定义 SYSTEM_CPU_SET_INFORMATION 结构 (防止旧版 SDK 缺失)
-// 如果您的编译环境提示重定义，请注释掉此结构体
-typedef struct _SYSTEM_CPU_SET_INFORMATION {
-    DWORD Size;
-    DWORD Type; // CpuSetInformation
-    struct {
-        DWORD Id;
-        WORD Group;
-        BYTE LogicalProcessorIndex;
-        BYTE CoreIndex;
-        BYTE LastLevelCacheIndex;
-        BYTE NumaNodeIndex;
-        BYTE EfficiencyClass;
-        union {
-            BYTE AllFlags;
-            struct {
-                BYTE Parked : 1;
-                BYTE Allocated : 1;
-                BYTE AllocatedToTargetProcess : 1;
-                BYTE RealTime : 1;
-                BYTE ReservedFlags : 4;
-            } DUMMYSTRUCTNAME;
-        } DUMMYUNIONNAME;
-        union {
-            DWORD Reserved;
-            BYTE SchedulingClass;
-        };
-        DWORD64 AllocationTag;
-    } CpuSet;
-} SYSTEM_CPU_SET_INFORMATION, *PSYSTEM_CPU_SET_INFORMATION;
-
 using GetSystemCpuSetInformationPtr = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
 using SetThreadSelectedCpuSetsPtr = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
 

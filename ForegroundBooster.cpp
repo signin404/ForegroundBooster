@@ -108,8 +108,9 @@ struct Settings
     int weight = -1;
     int processListInterval = 60;
     int idealCore = -1;
+    int cpuSetInterval = 600;
     // --- 新增 ---
-    int cpuSetInterval = 600; // 默认 600 秒 (10分钟)
+    bool optimizeOtherThreads = false; // 是否优化其余线程
     // -----------
 };
 Settings settings;
@@ -261,6 +262,7 @@ void ParseIniFile(const std::wstring& path)
                     else if (key == L"ProcessList") settings.processListInterval = std::stoi(value);
                     else if (key == L"IdealCore") settings.idealCore = std::stoi(value);
 					else if (key == L"CpuSetInterval") settings.cpuSetInterval = std::stoi(value);
+					else if (key == L"OptimizeOtherThreads") settings.optimizeOtherThreads = (std::stoi(value) != 0);
                 }
             }
             else if (currentSection == L"BlackList")
@@ -790,8 +792,78 @@ typedef struct _THREAD_BASIC_INFORMATION {
 // 4. 定义函数指针 (现在 THREADINFOCLASS 已定义 不会报错了)
 using NtQueryInformationThreadPtr = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 
+// --- 新增：CPU 拓扑分析结构 ---
+struct CpuTopology {
+    std::vector<DWORD> pCores;      // 性能核 (物理主核)
+    std::vector<DWORD> htCores;     // 超线程 (逻辑核)
+    std::vector<DWORD> eCores;      // 效率核
+    std::map<DWORD, DWORD> lpToCoreIndex; // 逻辑核 -> 物理核索引映射
+    bool isInitialized = false;
+};
+
+// 辅助函数：分析系统拓扑
+void AnalyzeCpuTopology(GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation, CpuTopology& topology) {
+    if (!pGetSystemCpuSetInformation || topology.isInitialized) return;
+
+    ULONG returnLength = 0;
+    pGetSystemCpuSetInformation(NULL, 0, &returnLength, GetCurrentProcess(), 0);
+    if (returnLength == 0) return;
+
+    std::vector<BYTE> buffer(returnLength);
+    if (!pGetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buffer.data(), returnLength, &returnLength, GetCurrentProcess(), 0)) return;
+
+    std::map<DWORD, std::vector<DWORD>> coreGroups; // CoreIndex -> [LogicalProcessors]
+    std::map<DWORD, BYTE> coreEfficiency;           // CoreIndex -> EfficiencyClass
+
+    BYTE* ptr = buffer.data();
+    BYTE* end = ptr + returnLength;
+
+    while (ptr < end) {
+        PSYSTEM_CPU_SET_INFORMATION entry = (PSYSTEM_CPU_SET_INFORMATION)ptr;
+        if (entry->Type == 0) { // CpuSetInformation
+            coreGroups[entry->CpuSet.CoreIndex].push_back(entry->CpuSet.LogicalProcessorIndex);
+            coreEfficiency[entry->CpuSet.CoreIndex] = entry->CpuSet.EfficiencyClass;
+            topology.lpToCoreIndex[entry->CpuSet.LogicalProcessorIndex] = entry->CpuSet.CoreIndex;
+        }
+        if (entry->Size == 0) break;
+        ptr += entry->Size;
+    }
+
+    // 分类核心
+    for (auto& pair : coreGroups) {
+        DWORD coreIndex = pair.first;
+        std::vector<DWORD>& lps = pair.second;
+        BYTE eff = coreEfficiency[coreIndex];
+
+        // 简单假设：EfficiencyClass 0 为 E核 >=1 为 P核 (适用于 Intel 12/13/14代)
+        // 如果所有核心 EfficiencyClass 都相同 则视为全 P核
+        if (eff == 0 && coreEfficiency.size() > 1) {
+            // E-Cores
+            for (DWORD lp : lps) topology.eCores.push_back(lp);
+        } else {
+            // P-Cores & HT
+            std::sort(lps.begin(), lps.end());
+            if (!lps.empty()) {
+                topology.pCores.push_back(lps[0]); // 第一个逻辑核视为物理主核
+                for (size_t i = 1; i < lps.size(); ++i) {
+                    topology.htCores.push_back(lps[i]); // 后续的视为超线程
+                }
+            }
+        }
+    }
+
+    // 排序以确保顺序确定性
+    std::sort(topology.pCores.begin(), topology.pCores.end()); // 正序
+    std::sort(topology.htCores.begin(), topology.htCores.end()); // 正序 (稍后使用时再倒序)
+    std::sort(topology.eCores.begin(), topology.eCores.end()); // 正序
+
+    topology.isInitialized = true;
+    LogColor(COLOR_INFO, "[拓扑] P核: %zu, HT: %zu, E核: %zu\n", topology.pCores.size(), topology.htCores.size(), topology.eCores.size());
+}
+
 void ThreadOptimizerThread()
 {
+    // --- 加载 API ---
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
 
@@ -807,6 +879,7 @@ void ThreadOptimizerThread()
         LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+) 优化功能受限\n");
     }
 
+    // --- 预先解析 IdealCore 对应的 CpuSetId ---
     ULONG idealCoreCpuSetId = 0;
     ULONG mainThreadFallbackCpuSetId = 0;
 
@@ -817,10 +890,13 @@ void ThreadOptimizerThread()
         }
     }
 
+    // --- 初始化拓扑结构 ---
+    CpuTopology topology;
     DWORD previousPid = 0;
 
     while (true)
     {
+        // 1. 持续监控：每秒唤醒一次
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         DWORD currentPid = lastProcessId;
@@ -859,6 +935,11 @@ void ThreadOptimizerThread()
             continue;
         }
 
+        // --- 初始化拓扑 (仅一次) ---
+        if (!topology.isInitialized && pGetSystemCpuSetInformation) {
+            AnalyzeCpuTopology(pGetSystemCpuSetInformation, topology);
+        }
+
         FILETIME ftSystem;
         GetSystemTimeAsFileTime(&ftSystem);
         ULARGE_INTEGER now = FT2ULL(ftSystem);
@@ -875,25 +956,21 @@ void ThreadOptimizerThread()
             ProcessStats& procStats = g_processStatsCache[currentPid];
             procStats.processId = currentPid;
 
-            // --- 关键逻辑：检测前台切换 ---
+            // --- 检测前台切换 ---
             if (currentPid != previousPid)
             {
-                // 检查是否为新进程 (lastOptimizationTime 为 0 表示从未优化过)
                 if (procStats.lastOptimizationTime.QuadPart == 0)
                 {
                     LogColor(COLOR_INFO, "[监控] 新进程 %lu 立即执行首次优化\n", currentPid);
-                    // 注意：这里不重置 lastOptimizationTime 保持为 0
-                    // 这样下面的 (now - 0 > interval) 判断会成立 触发立即执行
                 }
                 else
                 {
                     LogColor(COLOR_INFO, "[监控] 旧进程 %lu 将在 %d 秒后应用优化\n", currentPid, settings.cpuSetInterval);
-                    procStats.lastOptimizationTime = now; // 重置计时器 强制等待完整周期
+                    procStats.lastOptimizationTime = now; // 重置计时器
 
-                    // 重置现有线程的快照 开始新的观察周期
+                    // 重置快照
                     for (auto& pair : procStats.threads) {
                         pair.second.intervalStartTime = now;
-                        // 同步内核/用户时间基准 避免计算出错误的巨大负载
                         pair.second.intervalStartKernelTime = pair.second.lastKernelTime;
                         pair.second.intervalStartUserTime = pair.second.lastUserTime;
                     }
@@ -930,7 +1007,6 @@ void ThreadOptimizerThread()
                                     ts.lastUserTime = FT2ULL(ftUser);
                                     ts.lastCheckTime = now;
 
-                                    // 初始化周期快照
                                     ts.intervalStartKernelTime = ts.lastKernelTime;
                                     ts.intervalStartUserTime = ts.lastUserTime;
                                     ts.intervalStartTime = now;
@@ -941,7 +1017,6 @@ void ThreadOptimizerThread()
                         }
                         else
                         {
-                            // 维护现有线程的瞬时数据 (lastKernelTime 等)
                             ThreadStats& ts = procStats.threads[tid];
                             HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
                             if (hThread)
@@ -953,8 +1028,6 @@ void ThreadOptimizerThread()
                                     ts.lastUserTime = FT2ULL(ftUser);
                                     ts.lastCheckTime = now;
 
-                                    // 如果该线程的周期开始时间与当前周期不符 (例如旧进程切换回来后的首次循环)
-                                    // 且不是因为"新进程立即执行"导致的差异
                                     if (procStats.lastOptimizationTime.QuadPart != 0 &&
                                         ts.intervalStartTime.QuadPart != procStats.lastOptimizationTime.QuadPart)
                                     {
@@ -985,46 +1058,36 @@ void ThreadOptimizerThread()
             ULONGLONG timeSinceLastOpt = now.QuadPart - procStats.lastOptimizationTime.QuadPart;
             ULONGLONG intervalUnits = (ULONGLONG)settings.cpuSetInterval * 10000000ULL;
 
-            // 如果是新进程(lastOpt=0) timeSinceLastOpt 会非常大 必然 > intervalUnits 触发立即执行
             if (timeSinceLastOpt >= intervalUnits)
             {
                 bool isImmediateRun = (procStats.lastOptimizationTime.QuadPart == 0);
-                if (isImmediateRun) {
-                    LogColor(COLOR_INFO, "[分析] 触发新进程立即优化...\n");
-                } else {
-                    LogColor(COLOR_INFO, "[分析] 观察周期结束 正在计算平均负载并应用优化...\n");
-                }
+                if (isImmediateRun) LogColor(COLOR_INFO, "[分析] 触发新进程立即优化...\n");
+                else LogColor(COLOR_INFO, "[分析] 观察周期结束 正在计算平均负载并应用优化...\n");
 
-                // 1. 计算周期内的平均负载
+                // 1. 计算平均负载
                 for (auto& pair : procStats.threads)
                 {
                     ThreadStats& ts = pair.second;
-                    // 如果是立即执行 时间差几乎为0 负载设为0
                     if (isImmediateRun) {
                         ts.intervalAverageLoad = 0.0;
                         continue;
                     }
 
-                    // 正常计算
                     ULONGLONG timeDelta = now.QuadPart - ts.intervalStartTime.QuadPart;
                     ULONGLONG workDelta = (ts.lastKernelTime.QuadPart - ts.intervalStartKernelTime.QuadPart) +
                                           (ts.lastUserTime.QuadPart - ts.intervalStartUserTime.QuadPart);
 
-                    if (timeDelta > 0)
-                        ts.intervalAverageLoad = (double)workDelta / (double)timeDelta * 100.0;
-                    else
-                        ts.intervalAverageLoad = 0.0;
+                    if (timeDelta > 0) ts.intervalAverageLoad = (double)workDelta / (double)timeDelta * 100.0;
+                    else ts.intervalAverageLoad = 0.0;
 
-                    // 重置快照
                     ts.intervalStartKernelTime = ts.lastKernelTime;
                     ts.intervalStartUserTime = ts.lastUserTime;
                     ts.intervalStartTime = now;
                 }
 
-                // 更新上次优化时间 (这会结束"新进程"状态)
                 procStats.lastOptimizationTime = now;
 
-                // 2. 识别主线程和重负载线程
+                // 2. 识别线程
                 ThreadStats* pMainThread = nullptr;
                 ThreadStats* pHeavyThread = nullptr;
 
@@ -1035,7 +1098,6 @@ void ThreadOptimizerThread()
                         pMainThread = &t;
                 }
 
-                // 仅在非立即执行模式下查找重负载线程
                 if (!isImmediateRun)
                 {
                     for (auto& pair : procStats.threads)
@@ -1051,7 +1113,7 @@ void ThreadOptimizerThread()
 
                 if (pMainThread) pMainThread->isMainThread = true;
 
-                // --- 辅助 Lambda ---
+                // --- 辅助 Lambda: 亲和性修正 ---
                 auto EnsureCoreInAffinity = [&](HANDLE hThread, DWORD coreIndex) {
                     if (!pNtQueryInformationThread) return;
                     THREAD_BASIC_INFORMATION tbi;
@@ -1068,11 +1130,17 @@ void ThreadOptimizerThread()
                 // --- 执行优化策略 ---
                 if (settings.idealCore >= 0 && pMainThread && pSetThreadSelectedCpuSets && idealCoreCpuSetId != 0)
                 {
-                    // 策略 A: 存在重负载辅助线程 (且不是立即执行模式)
+                    DWORD assignedMainCore = settings.idealCore;
+                    DWORD assignedHeavyCore = settings.idealCore;
+
+                    // 策略 A: 存在重负载辅助线程
                     if (pHeavyThread && pHeavyThread->intervalAverageLoad > 10.0)
                     {
                         LogColor(COLOR_INFO, "  -> 检测到重负载线程 %lu (平均负载 %.1f%%) 执行分离策略\n",
                             pHeavyThread->threadId, pHeavyThread->intervalAverageLoad);
+
+                        assignedHeavyCore = settings.idealCore;
+                        assignedMainCore = settings.idealCore - 2;
 
                         // 1. 设置重负载线程 -> IdealCore
                         if (!pHeavyThread->hasCpuSets || pHeavyThread->assignedCpuSetId != idealCoreCpuSetId)
@@ -1124,9 +1192,12 @@ void ThreadOptimizerThread()
                             }
                         }
                     }
-                    // 策略 B: 无重负载辅助线程 (或立即执行模式)
+                    // 策略 B: 无重负载辅助线程
                     else
                     {
+                        assignedMainCore = settings.idealCore;
+                        assignedHeavyCore = settings.idealCore;
+
                         // 清理辅助线程
                         for (auto& pair : procStats.threads) {
                             ThreadStats& t = pair.second;
@@ -1155,6 +1226,74 @@ void ThreadOptimizerThread()
                                     pMainThread->assignedCpuSetId = idealCoreCpuSetId;
                                 }
                                 CloseHandle(hMain);
+                            }
+                        }
+                    }
+
+                    // --- 策略 C: 优化其余线程 (Ideal Processor) ---
+                    if (settings.optimizeOtherThreads && topology.isInitialized)
+                    {
+                        // 1. 收集其余线程并按负载排序
+                        std::vector<ThreadStats*> otherThreads;
+                        for (auto& pair : procStats.threads) {
+                            ThreadStats* t = &pair.second;
+                            if (t->threadId == pMainThread->threadId) continue;
+                            if (pHeavyThread && t->threadId == pHeavyThread->threadId) continue;
+                            otherThreads.push_back(t);
+                        }
+
+                        std::sort(otherThreads.begin(), otherThreads.end(), [](ThreadStats* a, ThreadStats* b) {
+                            return a->intervalAverageLoad > b->intervalAverageLoad;
+                        });
+
+                        if (!otherThreads.empty())
+                        {
+                            // 2. 构建分配队列
+                            std::vector<DWORD> allocationQueue;
+
+                            // (1) 性能核心 (正序 排除已占用)
+                            for (DWORD core : topology.pCores) {
+                                if (core == assignedMainCore || core == assignedHeavyCore) continue;
+                                allocationQueue.push_back(core);
+                            }
+
+                            // (2) 超线程 (倒序 特殊规则)
+                            std::vector<DWORD> htQueue;
+                            DWORD mainHT = -1;
+                            DWORD heavyHT = -1;
+
+                            DWORD mainCoreIndex = topology.lpToCoreIndex.count(assignedMainCore) ? topology.lpToCoreIndex[assignedMainCore] : -1;
+                            DWORD heavyCoreIndex = topology.lpToCoreIndex.count(assignedHeavyCore) ? topology.lpToCoreIndex[assignedHeavyCore] : -1;
+
+                            for (DWORD core : topology.htCores) {
+                                DWORD coreIndex = topology.lpToCoreIndex[core];
+                                if (coreIndex == mainCoreIndex) mainHT = core;
+                                else if (coreIndex == heavyCoreIndex) heavyHT = core;
+                                else htQueue.push_back(core);
+                            }
+
+                            std::sort(htQueue.rbegin(), htQueue.rend()); // 倒序
+                            allocationQueue.insert(allocationQueue.end(), htQueue.begin(), htQueue.end());
+
+                            if (mainHT != -1) allocationQueue.push_back(mainHT);
+                            if (heavyHT != -1 && heavyHT != mainHT) allocationQueue.push_back(heavyHT);
+
+                            // (3) 效率核心 (正序)
+                            allocationQueue.insert(allocationQueue.end(), topology.eCores.begin(), topology.eCores.end());
+
+                            // 3. 分配核心
+                            if (!allocationQueue.empty())
+                            {
+                                LogColor(COLOR_INFO, "  -> [其余线程] 正在为 %zu 个线程分配理想核心 (队列长度: %zu)...\n", otherThreads.size(), allocationQueue.size());
+
+                                for (size_t i = 0; i < otherThreads.size(); ++i) {
+                                    DWORD targetCore = allocationQueue[i % allocationQueue.size()];
+                                    HANDLE hThread = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, otherThreads[i]->threadId);
+                                    if (hThread) {
+                                        SetThreadIdealProcessor(hThread, targetCore);
+                                        CloseHandle(hThread);
+                                    }
+                                }
                             }
                         }
                     }

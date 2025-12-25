@@ -972,6 +972,38 @@ void ThreadOptimizerThread()
 
         if (currentPid == 0) continue;
 
+        // --- 新增：黑名单检查 (带缓存) ---
+        static DWORD lastCheckedBlacklistPid = 0;
+        static bool isBlacklisted = false;
+
+        if (currentPid != lastCheckedBlacklistPid)
+        {
+            std::wstring name = GetProcessNameById(currentPid);
+            // 转换为小写并检查是否在黑名单中
+            if (blackList.count(to_lower(name)))
+            {
+                isBlacklisted = true;
+                LogColor(COLOR_WARNING, "[监控] 进程 %lu (%ws) 在黑名单中 跳过 CPU 优化\n", currentPid, name.c_str());
+
+                // 如果缓存中有该进程的数据 清除它
+                std::lock_guard<std::mutex> lock(g_statsMutex);
+                if (g_processStatsCache.count(currentPid))
+                {
+                    g_processStatsCache.erase(currentPid);
+                }
+            }
+            else
+            {
+                isBlacklisted = false;
+            }
+            lastCheckedBlacklistPid = currentPid;
+        }
+
+        if (isBlacklisted)
+        {
+            continue; // 直接跳过后续所有逻辑 (快照、计算、优化)
+        }
+
         // --- 快速检查：是否忽略 ---
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);

@@ -735,20 +735,25 @@ void EventMessageLoopThread()
 
 void ThreadOptimizerThread()
 {
-    // 尝试加载 SetThreadSelectedCpuSets (Win10 1709+)
+    // 动态加载 SetThreadSelectedCpuSets (Win10 1709+ 支持)
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
     SetThreadSelectedCpuSetsPtr pSetThreadSelectedCpuSets = 
         (SetThreadSelectedCpuSetsPtr)GetProcAddress(hKernel32, "SetThreadSelectedCpuSets");
 
+    if (!pSetThreadSelectedCpuSets)
+    {
+        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 SetThreadSelectedCpuSets API，将仅使用 IdealProcessor。\n");
+    }
+
     while (true)
     {
-        // 采样间隔：1秒。既能保证数据实时性，又不会占用过多CPU
+        // 采样间隔：1秒
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         DWORD currentPid = lastProcessId;
         if (currentPid == 0) continue;
 
-        // 1. 获取当前系统时间 (作为计算 CPU% 的分母)
+        // 1. 获取当前系统时间
         FILETIME ftSystem;
         GetSystemTimeAsFileTime(&ftSystem);
         ULARGE_INTEGER now = FT2ULL(ftSystem);
@@ -776,7 +781,7 @@ void ThreadOptimizerThread()
                         DWORD tid = te32.th32ThreadID;
                         currentThreadIds.push_back(tid);
 
-                        // 如果是新发现的线程，初始化它
+                        // 初始化或更新线程数据
                         if (procStats.threads.find(tid) == procStats.threads.end())
                         {
                             HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
@@ -798,7 +803,6 @@ void ThreadOptimizerThread()
                         }
                         else
                         {
-                            // 如果是已存在的线程，计算负载
                             ThreadStats& ts = procStats.threads[tid];
                             HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
                             if (hThread)
@@ -816,7 +820,6 @@ void ThreadOptimizerThread()
                                     if (timeDelta > 0)
                                     {
                                         ts.currentLoad = (double)workDelta / (double)timeDelta * 100.0;
-                                        // 使用 EMA (指数移动平均) 平滑负载，权重 0.3
                                         ts.smoothedLoad = 0.3 * ts.currentLoad + 0.7 * ts.smoothedLoad;
                                     }
 
@@ -845,53 +848,54 @@ void ThreadOptimizerThread()
             // --- 分析与应用策略 ---
             if (!procStats.threads.empty())
             {
-                // 1. 寻找主线程 (创建时间最早)
                 ThreadStats* pMainThread = nullptr;
-                // 2. 寻找负载最重的线程 (SmoothedLoad 最高)
                 ThreadStats* pHeavyThread = nullptr;
 
                 for (auto& pair : procStats.threads)
                 {
                     ThreadStats& t = pair.second;
-                    
-                    // 判定主线程
                     if (pMainThread == nullptr || CompareFileTime(&t.creationTime, &pMainThread->creationTime) < 0)
-                    {
                         pMainThread = &t;
-                    }
 
-                    // 判定重负载线程 (排除主线程，避免冲突)
                     if (pMainThread && t.threadId != pMainThread->threadId)
                     {
                         if (pHeavyThread == nullptr || t.smoothedLoad > pHeavyThread->smoothedLoad)
-                        {
                             pHeavyThread = &t;
-                        }
                     }
                 }
 
-                // 标记主线程
                 if (pMainThread) pMainThread->isMainThread = true;
 
-                // --- 执行优化策略 (仅当配置了 IdealCore 时) ---
+                // --- 执行优化策略 ---
                 if (settings.idealCore >= 0 && pMainThread)
                 {
-                    // 策略 A: 主线程绑定到 IdealCore
                     HANDLE hMain = OpenThread(THREAD_SET_INFORMATION, FALSE, pMainThread->threadId);
                     if (hMain)
                     {
+                        // 1. 设置理想核心 (软性建议)
                         SetThreadIdealProcessor(hMain, settings.idealCore);
                         
-                        // 如果支持 CPU Sets，也可以在这里设置 (示例: 绑定到 IdealCore)
-                        // ULONG cpuSet[] = { (ULONG)settings.idealCore };
-                        // if (pSetThreadSelectedCpuSets) pSetThreadSelectedCpuSets(hMain, cpuSet, 1);
+                        // 2. 设置 CPU Sets (硬性建议) - 修复部分
+                        if (pSetThreadSelectedCpuSets)
+                        {
+                            ULONG cpuSet[] = { (ULONG)settings.idealCore };
+                            // 将主线程限制在 IdealCore 上运行
+                            if (pSetThreadSelectedCpuSets(hMain, cpuSet, 1))
+                            {
+                                // 仅在首次成功时记录，避免刷屏
+                                static DWORD lastReportedTid = 0;
+                                if (lastReportedTid != pMainThread->threadId) {
+                                    LogColor(COLOR_SUCCESS, "  -> [优化] 已为主线程 %lu 设置 CPU Set: %d\n", pMainThread->threadId, settings.idealCore);
+                                    lastReportedTid = pMainThread->threadId;
+                                }
+                            }
+                        }
                         
                         CloseHandle(hMain);
                     }
 
-                    // 策略 B: 将最重的辅助线程“隔离”到另一个核心 (例如 IdealCore - 2)
-                    // 这样可以避免渲染线程和主逻辑线程抢占同一个物理核
-                    if (pHeavyThread && pHeavyThread->smoothedLoad > 10.0) // 只有负载显著时才处理
+                    // 策略 B: 隔离重负载线程
+                    if (pHeavyThread && pHeavyThread->smoothedLoad > 10.0)
                     {
                         int heavyCore = settings.idealCore - 2;
                         if (heavyCore >= 0) 
@@ -900,13 +904,14 @@ void ThreadOptimizerThread()
                             if (hHeavy)
                             {
                                 SetThreadIdealProcessor(hHeavy, heavyCore);
+                                // 对重负载线程也可以设置 CPU Sets，视需求而定，这里暂只设置理想核以保持灵活性
                                 CloseHandle(hHeavy);
                             }
                         }
                     }
                 }
             }
-        } // 解锁
+        } 
         
         CloseHandle(hSnapshot);
     }
@@ -918,44 +923,48 @@ void ProcessListCheckThread()
     {
         std::this_thread::sleep_for(std::chrono::seconds(settings.processListInterval));
         
-        // --- 缓存清理逻辑 (新增) ---
+        // 检查前台是否发生变化
+        if (g_foregroundHasChanged.exchange(false))
         {
-            std::lock_guard<std::mutex> lock(g_statsMutex);
-            if (!g_processStatsCache.empty())
-            {
-                // 获取当前所有运行中的 PID
-                std::set<DWORD> runningPids;
-                HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                if (hSnapshot != INVALID_HANDLE_VALUE)
-                {
-                    PROCESSENTRY32W pe32;
-                    pe32.dwSize = sizeof(PROCESSENTRY32W);
-                    if (Process32FirstW(hSnapshot, &pe32))
-                    {
-                        do { runningPids.insert(pe32.th32ProcessID); } while (Process32NextW(hSnapshot, &pe32));
-                    }
-                    CloseHandle(hSnapshot);
-                }
+            LogColor(COLOR_INFO, "[状态变更] 前台进程已切换，正在执行维护任务...\n");
 
-                // 遍历缓存，移除不在 runningPids 中的进程
-                for (auto it = g_processStatsCache.begin(); it != g_processStatsCache.end(); )
+            // --- 1. 清理已退出进程的缓存数据 (仅在此处执行) ---
+            {
+                std::lock_guard<std::mutex> lock(g_statsMutex);
+                if (!g_processStatsCache.empty())
                 {
-                    if (runningPids.find(it->first) == runningPids.end())
+                    // 获取当前所有运行中的 PID
+                    std::set<DWORD> runningPids;
+                    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                    if (hSnapshot != INVALID_HANDLE_VALUE)
                     {
-                        Log("[缓存清理] 进程 PID %lu 已退出，清除其线程负载数据。\n", it->first);
-                        it = g_processStatsCache.erase(it);
+                        PROCESSENTRY32W pe32;
+                        pe32.dwSize = sizeof(PROCESSENTRY32W);
+                        if (Process32FirstW(hSnapshot, &pe32))
+                        {
+                            do { runningPids.insert(pe32.th32ProcessID); } while (Process32NextW(hSnapshot, &pe32));
+                        }
+                        CloseHandle(hSnapshot);
                     }
-                    else
+
+                    // 遍历缓存，移除不在 runningPids 中的进程
+                    for (auto it = g_processStatsCache.begin(); it != g_processStatsCache.end(); )
                     {
-                        ++it;
+                        if (runningPids.find(it->first) == runningPids.end())
+                        {
+                            LogColor(COLOR_DEFAULT, "  -> [缓存清理] 进程 PID %lu 已退出，清除其线程负载数据。\n", it->first);
+                            it = g_processStatsCache.erase(it);
+                        }
+                        else
+                        {
+                            ++it;
+                        }
                     }
                 }
             }
-        }
-        // ---------------------------
+            // --------------------------------------------------
 
-        if (g_foregroundHasChanged.exchange(false))
-        {
+            // --- 2. 扫描并重置后台进程优先级 ---
             ScanAndResetIoPriorities();
         }
     }

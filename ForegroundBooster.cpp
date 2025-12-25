@@ -56,8 +56,9 @@ struct ProcessStats {
     std::map<DWORD, ThreadStats> threads;
     bool isInitialized;
     bool ignoreMonitoring;
+    ULARGE_INTEGER lastOptimizationTime;
     // --- 新增 ---
-    ULARGE_INTEGER lastOptimizationTime; // 上次执行 CPU Sets 设置的时间
+    ULARGE_INTEGER lastForegroundTime; // 最后一次在前台的时间
     // -----------
 };
 
@@ -109,8 +110,9 @@ struct Settings
     int processListInterval = 60;
     int idealCore = -1;
     int cpuSetInterval = 600;
+    bool optimizeOtherThreads = false;
     // --- 新增 ---
-    bool optimizeOtherThreads = false; // 是否优化其余线程
+    int cpuSetResetInterval = 300; // 后台重置间隔 默认 300 秒 (5分钟)
     // -----------
 };
 Settings settings;
@@ -263,6 +265,7 @@ void ParseIniFile(const std::wstring& path)
                     else if (key == L"IdealCore") settings.idealCore = std::stoi(value);
 					else if (key == L"CpuSetInterval") settings.cpuSetInterval = std::stoi(value);
 					else if (key == L"OptimizeOtherThreads") settings.optimizeOtherThreads = (std::stoi(value) != 0);
+					else if (key == L"CpuSetResetInterval") settings.optimizeOtherThreads = (std::stoi(value) != 0);
                 }
             }
             else if (currentSection == L"BlackList")
@@ -861,9 +864,10 @@ void AnalyzeCpuTopology(GetSystemCpuSetInformationPtr pGetSystemCpuSetInformatio
     LogColor(COLOR_INFO, "[拓扑] P核: %zu, HT: %zu, E核: %zu\n", topology.pCores.size(), topology.htCores.size(), topology.eCores.size());
 }
 
+using GetProcessDefaultCpuSetsPtr = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
+
 void ThreadOptimizerThread()
 {
-    // --- 加载 API ---
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
     HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
 
@@ -871,6 +875,10 @@ void ThreadOptimizerThread()
         (SetThreadSelectedCpuSetsPtr)GetProcAddress(hKernel32, "SetThreadSelectedCpuSets");
     GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation =
         (GetSystemCpuSetInformationPtr)GetProcAddress(hKernel32, "GetSystemCpuSetInformation");
+    // --- 新增 ---
+    GetProcessDefaultCpuSetsPtr pGetProcessDefaultCpuSets =
+        (GetProcessDefaultCpuSetsPtr)GetProcAddress(hKernel32, "GetProcessDefaultCpuSets");
+    // -----------
     NtQueryInformationThreadPtr pNtQueryInformationThread =
         (NtQueryInformationThreadPtr)GetProcAddress(hNtdll, "NtQueryInformationThread");
 
@@ -879,7 +887,6 @@ void ThreadOptimizerThread()
         LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+) 优化功能受限\n");
     }
 
-    // --- 预先解析 IdealCore 对应的 CpuSetId ---
     ULONG idealCoreCpuSetId = 0;
     ULONG mainThreadFallbackCpuSetId = 0;
 
@@ -890,38 +897,125 @@ void ThreadOptimizerThread()
         }
     }
 
-    // --- 初始化拓扑结构 ---
+    // --- 新增：拓扑结构 ---
     CpuTopology topology;
+    // --------------------
+
     DWORD previousPid = 0;
 
     while (true)
     {
-        // 1. 持续监控：每秒唤醒一次
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         DWORD currentPid = lastProcessId;
+        // 注意：即使 currentPid 为 0 我们也可能需要执行清理逻辑 所以这里不直接 continue
+        // 但为了保持逻辑简单 我们假设总有一个前台进程如果 currentPid 为 0 我们只跳过优化部分
+
+        FILETIME ftSystem;
+        GetSystemTimeAsFileTime(&ftSystem);
+        ULARGE_INTEGER now = FT2ULL(ftSystem);
+
+        // --- 新增：后台进程清理逻辑 ---
+        if (settings.cpuSetResetInterval > 0 && pSetThreadSelectedCpuSets)
+        {
+            std::lock_guard<std::mutex> lock(g_statsMutex);
+            ULONGLONG resetThreshold = (ULONGLONG)settings.cpuSetResetInterval * 10000000ULL;
+
+            for (auto& procPair : g_processStatsCache)
+            {
+                DWORD pid = procPair.first;
+                ProcessStats& pStats = procPair.second;
+
+                // 1. 如果是当前前台进程 更新时间戳
+                if (pid == currentPid)
+                {
+                    pStats.lastForegroundTime = now;
+                    continue; // 跳过清理检查
+                }
+
+                // 2. 检查后台超时
+                // 确保 lastForegroundTime 已初始化 (非0)
+                if (pStats.lastForegroundTime.QuadPart > 0 && now.QuadPart > pStats.lastForegroundTime.QuadPart)
+                {
+                    ULONGLONG timeInBg = now.QuadPart - pStats.lastForegroundTime.QuadPart;
+
+                    if (timeInBg > resetThreshold)
+                    {
+                        bool anyReset = false;
+                        // 遍历该进程的所有线程
+                        for (auto& threadPair : pStats.threads)
+                        {
+                            ThreadStats& tStats = threadPair.second;
+
+                            // 如果该线程被标记为设置了 CPU Sets
+                            if (tStats.hasCpuSets)
+                            {
+                                HANDLE hThread = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, tStats.threadId);
+                                if (hThread)
+                                {
+                                    // 清空 CPU Sets (传入 NULL, 0)
+                                    if (pSetThreadSelectedCpuSets(hThread, NULL, 0))
+                                    {
+                                        anyReset = true;
+                                    }
+                                    CloseHandle(hThread);
+                                }
+                                // 无论 API 调用是否成功(可能线程已死) 都重置标记 避免重复尝试
+                                tStats.hasCpuSets = false;
+                                tStats.assignedCpuSetId = 0;
+                            }
+                        }
+
+                        if (anyReset)
+                        {
+                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 已在后台超过 %d 秒 重置其线程 CPU Sets\n",
+                                pid, settings.cpuSetResetInterval);
+                            // 更新时间戳以避免在下一秒重复触发日志 (虽然 hasCpuSets 已经 false 了)
+                            pStats.lastForegroundTime = now;
+                        }
+                    }
+                }
+            }
+        }
+        // ---------------------------
+
         if (currentPid == 0) continue;
 
-        // --- 快速检查：是否忽略 ---
+        // --- 1. 快速检查：是否已标记为忽略 ---
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             if (g_processStatsCache.count(currentPid) && g_processStatsCache[currentPid].ignoreMonitoring) continue;
         }
 
-        // --- 亲和性检查 ---
-        bool customAffinityDetected = false;
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, currentPid);
+        // --- 2. 亲和性与 CPU Sets 检查 ---
+        bool customConfigDetected = false;
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, currentPid);
         if (hProcess)
         {
+            // A. 检查亲和性
             DWORD_PTR processAffinity, systemAffinity;
             if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity))
             {
-                if (processAffinity != systemAffinity) customAffinityDetected = true;
+                if (processAffinity != systemAffinity) customConfigDetected = true;
             }
+
+            // B. 检查进程 CPU Sets (如果亲和性正常 且 API 可用)
+            if (!customConfigDetected && pGetProcessDefaultCpuSets)
+            {
+                ULONG requiredIdCount = 0;
+                // 调用一次以获取 ID 数量 如果数量 > 0 说明设置了 CPU Sets
+                pGetProcessDefaultCpuSets(hProcess, NULL, 0, &requiredIdCount);
+                if (requiredIdCount > 0)
+                {
+                    customConfigDetected = true;
+                }
+            }
+
             CloseHandle(hProcess);
         }
 
-        if (customAffinityDetected)
+        // 如果检测到自定义配置 (亲和性 或 CPU Sets) 停止监控
+        if (customConfigDetected)
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             ProcessStats& procStats = g_processStatsCache[currentPid];
@@ -930,7 +1024,7 @@ void ThreadOptimizerThread()
             {
                 procStats.ignoreMonitoring = true;
                 procStats.threads.clear();
-                LogColor(COLOR_WARNING, "  -> [监控停止] 进程 %lu 已设置亲和性 停止追踪其线程负载\n", currentPid);
+                LogColor(COLOR_WARNING, "  -> [监控停止] 进程 %lu 已设置设置亲和性或 CPU Sets 停止追踪其线程负载\n", currentPid);
             }
             continue;
         }
@@ -1231,7 +1325,7 @@ void ThreadOptimizerThread()
                     }
 
                     // --- 策略 C: 优化其余线程 (Ideal Processor) ---
-                    if (settings.optimizeOtherThreads && topology.isInitialized)
+                    if (settings.optimizeOtherThreads && topology.isInitialized && !isImmediateRun)
                     {
                         // 1. 收集其余线程并按负载排序
                         std::vector<ThreadStats*> otherThreads;

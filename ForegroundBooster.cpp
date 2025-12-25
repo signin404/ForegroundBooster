@@ -733,32 +733,127 @@ void EventMessageLoopThread()
     if(g_hForegroundHook) UnhookWinEvent(g_hForegroundHook);
 }
 
+// --- 新增：CPU Sets API 定义与辅助函数 ---
+
+// 定义 SYSTEM_CPU_SET_INFORMATION 结构 (防止旧版 SDK 缺失)
+// 如果您的编译环境提示重定义，请注释掉此结构体
+typedef struct _SYSTEM_CPU_SET_INFORMATION {
+    DWORD Size;
+    DWORD Type; // CpuSetInformation
+    struct {
+        DWORD Id;
+        WORD Group;
+        BYTE LogicalProcessorIndex;
+        BYTE CoreIndex;
+        BYTE LastLevelCacheIndex;
+        BYTE NumaNodeIndex;
+        BYTE EfficiencyClass;
+        union {
+            BYTE AllFlags;
+            struct {
+                BYTE Parked : 1;
+                BYTE Allocated : 1;
+                BYTE AllocatedToTargetProcess : 1;
+                BYTE RealTime : 1;
+                BYTE ReservedFlags : 4;
+            } DUMMYSTRUCTNAME;
+        } DUMMYUNIONNAME;
+        union {
+            DWORD Reserved;
+            BYTE SchedulingClass;
+        };
+        DWORD64 AllocationTag;
+    } CpuSet;
+} SYSTEM_CPU_SET_INFORMATION, *PSYSTEM_CPU_SET_INFORMATION;
+
+using GetSystemCpuSetInformationPtr = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+using SetThreadSelectedCpuSetsPtr = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+
+// 辅助函数：将逻辑核心索引 (如 19) 转换为系统 CPU Set ID
+// 如果失败返回 0
+ULONG GetCpuSetIdFromLogicalIndex(DWORD logicalIndex, GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation) {
+    if (!pGetSystemCpuSetInformation) return 0;
+
+    ULONG returnLength = 0;
+    // 第一次调用获取所需缓冲区大小
+    pGetSystemCpuSetInformation(NULL, 0, &returnLength, GetCurrentProcess(), 0);
+    
+    if (returnLength == 0) return 0;
+
+    std::vector<BYTE> buffer(returnLength);
+    PSYSTEM_CPU_SET_INFORMATION pInfo = (PSYSTEM_CPU_SET_INFORMATION)buffer.data();
+
+    // 第二次调用获取实际数据
+    if (!pGetSystemCpuSetInformation(pInfo, returnLength, &returnLength, GetCurrentProcess(), 0)) {
+        return 0;
+    }
+
+    // 遍历缓冲区
+    BYTE* ptr = buffer.data();
+    BYTE* end = ptr + returnLength;
+
+    while (ptr < end) {
+        PSYSTEM_CPU_SET_INFORMATION entry = (PSYSTEM_CPU_SET_INFORMATION)ptr;
+        
+        // Type 0 是 CpuSetInformation
+        if (entry->Type == 0) { // CpuSetInformation
+            if (entry->CpuSet.LogicalProcessorIndex == logicalIndex) {
+                return entry->CpuSet.Id; // 找到对应的 ID
+            }
+        }
+
+        // 移动到下一个条目 (注意：必须使用 entry->Size，因为结构体大小可能随系统版本变化)
+        if (entry->Size == 0) break; // 防止死循环
+        ptr += entry->Size;
+    }
+
+    return 0; // 未找到
+}
+
 void ThreadOptimizerThread()
 {
-    // 动态加载 SetThreadSelectedCpuSets (Win10 1709+ 支持)
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    // 加载 API
     SetThreadSelectedCpuSetsPtr pSetThreadSelectedCpuSets = 
         (SetThreadSelectedCpuSetsPtr)GetProcAddress(hKernel32, "SetThreadSelectedCpuSets");
+    GetSystemCpuSetInformationPtr pGetSystemCpuSetInformation = 
+        (GetSystemCpuSetInformationPtr)GetProcAddress(hKernel32, "GetSystemCpuSetInformation");
 
-    if (!pSetThreadSelectedCpuSets)
+    if (!pSetThreadSelectedCpuSets || !pGetSystemCpuSetInformation)
     {
-        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 SetThreadSelectedCpuSets API，将仅使用 IdealProcessor。\n");
+        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+)，将仅使用 IdealProcessor。\n");
     }
+
+    // --- 预先解析 IdealCore 对应的 CpuSetId ---
+    ULONG targetCpuSetId = 0;
+    ULONG heavyCpuSetId = 0; // 用于重负载线程 (IdealCore - 1)
+
+    if (settings.idealCore >= 0 && pGetSystemCpuSetInformation) {
+        targetCpuSetId = GetCpuSetIdFromLogicalIndex((DWORD)settings.idealCore, pGetSystemCpuSetInformation);
+        if (targetCpuSetId != 0) {
+            LogColor(COLOR_INFO, "[CPU Sets] 逻辑核心 %d 映射为 CPU Set ID: %lu\n", settings.idealCore, targetCpuSetId);
+        } else {
+            LogColor(COLOR_ERROR, "[CPU Sets] 错误: 无法找到逻辑核心 %d 的 CPU Set ID。\n", settings.idealCore);
+        }
+
+        // 尝试解析 IdealCore - 1 (用于隔离重负载线程)
+        if (settings.idealCore > 0) {
+            heavyCpuSetId = GetCpuSetIdFromLogicalIndex((DWORD)(settings.idealCore - 1), pGetSystemCpuSetInformation);
+        }
+    }
+    // -------------------------------------------
 
     while (true)
     {
-        // 采样间隔：1秒
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         DWORD currentPid = lastProcessId;
         if (currentPid == 0) continue;
 
-        // 1. 获取当前系统时间
         FILETIME ftSystem;
         GetSystemTimeAsFileTime(&ftSystem);
         ULARGE_INTEGER now = FT2ULL(ftSystem);
 
-        // 2. 拍摄线程快照
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (hSnapshot == INVALID_HANDLE_VALUE) continue;
 
@@ -766,7 +861,6 @@ void ThreadOptimizerThread()
         THREADENTRY32 te32;
         te32.dwSize = sizeof(THREADENTRY32);
 
-        // --- 锁定缓存进行更新 ---
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             ProcessStats& procStats = g_processStatsCache[currentPid];
@@ -781,7 +875,6 @@ void ThreadOptimizerThread()
                         DWORD tid = te32.th32ThreadID;
                         currentThreadIds.push_back(tid);
 
-                        // 初始化或更新线程数据
                         if (procStats.threads.find(tid) == procStats.threads.end())
                         {
                             HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
@@ -834,7 +927,7 @@ void ThreadOptimizerThread()
                 } while (Thread32Next(hSnapshot, &te32));
             }
 
-            // 清理该进程中已经退出的线程
+            // 清理已退出的线程
             for (auto it = procStats.threads.begin(); it != procStats.threads.end(); )
             {
                 bool exists = false;
@@ -869,23 +962,23 @@ void ThreadOptimizerThread()
                 // --- 执行优化策略 ---
                 if (settings.idealCore >= 0 && pMainThread)
                 {
-                    HANDLE hMain = OpenThread(THREAD_SET_INFORMATION, FALSE, pMainThread->threadId);
+                    HANDLE hMain = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, pMainThread->threadId);
                     if (hMain)
                     {
                         // 1. 设置理想核心 (软性建议)
                         SetThreadIdealProcessor(hMain, settings.idealCore);
                         
-                        // 2. 设置 CPU Sets (硬性建议) - 修复部分
-                        if (pSetThreadSelectedCpuSets)
+                        // 2. 设置 CPU Sets (硬性建议) - 使用正确的 ID
+                        if (pSetThreadSelectedCpuSets && targetCpuSetId != 0)
                         {
-                            ULONG cpuSet[] = { (ULONG)settings.idealCore };
-                            // 将主线程限制在 IdealCore 上运行
-                            if (pSetThreadSelectedCpuSets(hMain, cpuSet, 1))
+                            ULONG cpuSetIds[] = { targetCpuSetId };
+                            // 注意：这里传入的是 ID 数组，而不是逻辑核心索引
+                            if (pSetThreadSelectedCpuSets(hMain, cpuSetIds, 1))
                             {
-                                // 仅在首次成功时记录，避免刷屏
                                 static DWORD lastReportedTid = 0;
                                 if (lastReportedTid != pMainThread->threadId) {
-                                    LogColor(COLOR_SUCCESS, "  -> [优化] 已为主线程 %lu 设置 CPU Set: %d\n", pMainThread->threadId, settings.idealCore);
+                                    LogColor(COLOR_SUCCESS, "  -> [优化] 主线程 %lu 已绑定 CPU Set ID: %lu (逻辑核: %d)\n", 
+                                        pMainThread->threadId, targetCpuSetId, settings.idealCore);
                                     lastReportedTid = pMainThread->threadId;
                                 }
                             }
@@ -897,14 +990,21 @@ void ThreadOptimizerThread()
                     // 策略 B: 隔离重负载线程
                     if (pHeavyThread && pHeavyThread->smoothedLoad > 10.0)
                     {
-                        int heavyCore = settings.idealCore - 2;
+                        int heavyCore = settings.idealCore - 1;
                         if (heavyCore >= 0) 
                         {
-                            HANDLE hHeavy = OpenThread(THREAD_SET_INFORMATION, FALSE, pHeavyThread->threadId);
+                            HANDLE hHeavy = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, pHeavyThread->threadId);
                             if (hHeavy)
                             {
                                 SetThreadIdealProcessor(hHeavy, heavyCore);
-                                // 对重负载线程也可以设置 CPU Sets，视需求而定，这里暂只设置理想核以保持灵活性
+                                
+                                // 如果我们也想为重负载线程设置 CPU Sets
+                                if (pSetThreadSelectedCpuSets && heavyCpuSetId != 0)
+                                {
+                                    ULONG cpuSetIds[] = { heavyCpuSetId };
+                                    pSetThreadSelectedCpuSets(hHeavy, cpuSetIds, 1);
+                                }
+
                                 CloseHandle(hHeavy);
                             }
                         }

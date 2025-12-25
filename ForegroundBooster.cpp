@@ -941,7 +941,7 @@ void ThreadOptimizerThread()
                     if (timeInBg > resetThreshold)
                     {
                         // 触发超时，先输出诊断信息
-                        // LogColor(COLOR_INFO, "[诊断] 进程 %lu 已后台 %llu 秒 (阈值 %d)，正在检查线程状态...\n", pid, timeInBg / 10000000, settings.cpuSetResetInterval);
+                        LogColor(COLOR_INFO, "[诊断] 进程 %lu 已后台 %llu 秒 (阈值 %d)，正在检查线程状态...\n", pid, timeInBg / 10000000, settings.cpuSetResetInterval);
 
                         bool triggeredReset = false;
                         int resetCount = 0;
@@ -978,7 +978,7 @@ void ThreadOptimizerThread()
                         else
                         {
                             // 如果没有线程需要重置，也记录一下，证明逻辑跑通了
-                            // LogColor(COLOR_DEFAULT, "  -> [诊断] 进程 %lu 无需重置 (未设置 CPU Sets)。\n", pid);
+                            LogColor(COLOR_DEFAULT, "  -> [诊断] 进程 %lu 无需重置 (未设置 CPU Sets)。\n", pid);
                         }
 
                         // 更新时间戳，避免下一秒重复检查

@@ -929,60 +929,65 @@ void ThreadOptimizerThread()
                 }
 
                 // 2. 检查后台超时
+                // 必须确保 lastForegroundTime 已被初始化 (>0)，否则忽略从未在前台出现过的进程
                 if (pStats.lastForegroundTime.QuadPart > 0 && now.QuadPart > pStats.lastForegroundTime.QuadPart)
                 {
                     ULONGLONG timeInBg = now.QuadPart - pStats.lastForegroundTime.QuadPart;
                     
                     if (timeInBg > resetThreshold)
                     {
-                        bool anyReset = false;
+                        bool triggeredReset = false; // 只要尝试了重置，就标记为真
+                        int resetCount = 0;
+
                         for (auto& threadPair : pStats.threads)
                         {
                             ThreadStats& tStats = threadPair.second;
                             
-                            // 只要设置过 CPU Sets，或者我们想确保清理干净
+                            // 检查是否标记为已设置 CPU Sets
                             if (tStats.hasCpuSets)
                             {
-                                // 使用更完整的权限打开线程
+                                triggeredReset = true; // 标记触发
+
+                                // 尝试打开线程句柄
                                 HANDLE hThread = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION, FALSE, tStats.threadId);
                                 if (hThread)
                                 {
-                                    // 1. 清空 CPU Sets (传入 NULL, 0)
-                                    BOOL cpuSetReset = pSetThreadSelectedCpuSets(hThread, NULL, 0);
+                                    // 1. 清空 CPU Sets
+                                    BOOL cpuSetResult = pSetThreadSelectedCpuSets(hThread, NULL, 0);
                                     
-                                    // 2. 重置理想处理器 (传入 MAXIMUM_PROCESSORS 表示取消设置)
-                                    DWORD idealReset = SetThreadIdealProcessor(hThread, MAXIMUM_PROCESSORS);
+                                    // 2. 重置理想处理器
+                                    DWORD idealResult = SetThreadIdealProcessor(hThread, MAXIMUM_PROCESSORS);
 
-                                    if (cpuSetReset)
+                                    if (cpuSetResult)
                                     {
-                                        anyReset = true;
-                                        // 可选：记录详细调试日志
-                                         LogColor(COLOR_DEFAULT, "     -> 线程 %lu CPU Sets 已重置。\n", tStats.threadId);
+                                        resetCount++;
                                     }
                                     else
                                     {
-                                        LogColor(COLOR_ERROR, "     -> [错误] 无法重置线程 %lu 的 CPU Sets。错误码: %lu\n", tStats.threadId, GetLastError());
+                                        // 输出 API 调用失败的错误日志
+                                        LogColor(COLOR_ERROR, "     -> [错误] 重置线程 %lu 失败。错误码: %lu\n", tStats.threadId, GetLastError());
                                     }
 
                                     CloseHandle(hThread);
                                 }
                                 else
                                 {
-                                    // 线程可能已退出，无法打开句柄
+                                    // 线程可能已退出，无法打开句柄，这是正常现象，但我们也记录一下
+                                     LogColor(COLOR_WARNING, "     -> [警告] 无法打开线程 %lu (可能已退出)。\n", tStats.threadId);
                                 }
 
-                                // 无论成功与否，清除标记以避免重复尝试
+                                // 无论成功与否，都清除标记，避免死循环尝试
                                 tStats.hasCpuSets = false;
                                 tStats.assignedCpuSetId = 0;
                             }
                         }
 
-                        if (anyReset)
+                        if (triggeredReset)
                         {
-                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 已在后台超过 %d 秒，已重置其所有线程的 CPU Sets 和理想核心。\n", 
-                                pid, settings.cpuSetResetInterval);
+                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 已在后台超过 %d 秒，触发重置 (成功重置 %d 个线程)。\n", 
+                                pid, settings.cpuSetResetInterval, resetCount);
                             
-                            // 更新时间戳，防止日志刷屏 (虽然 hasCpuSets 已清除，但这是一个好的实践)
+                            // 更新时间戳，防止日志在下一秒重复输出
                             pStats.lastForegroundTime = now; 
                         }
                     }

@@ -880,9 +880,14 @@ void ThreadOptimizerThread()
     NtQueryInformationThreadPtr pNtQueryInformationThread = 
         (NtQueryInformationThreadPtr)GetProcAddress(hNtdll, "NtQueryInformationThread");
 
+    // --- [调试] 启动自检 ---
+    LogColor(COLOR_INFO, "[调试] 优化线程启动。\n");
+    LogColor(COLOR_INFO, "[调试] API SetThreadSelectedCpuSets: %p\n", pSetThreadSelectedCpuSets);
+    LogColor(COLOR_INFO, "[调试] 配置 CpuSetResetInterval: %d\n", settings.cpuSetResetInterval);
+    
     if (!pSetThreadSelectedCpuSets || !pGetSystemCpuSetInformation)
     {
-        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+)，优化功能受限。\n");
+        LogColor(COLOR_WARNING, "[警告] 当前系统不支持 CPU Sets API (需要 Win10 1709+)。\n");
     }
 
     ULONG idealCoreCpuSetId = 0; 
@@ -897,6 +902,7 @@ void ThreadOptimizerThread()
 
     CpuTopology topology;
     DWORD previousPid = 0; 
+    int debugLogCounter = 0; // 用于控制调试日志频率
 
     while (true)
     {
@@ -908,47 +914,71 @@ void ThreadOptimizerThread()
         GetSystemTimeAsFileTime(&ftSystem);
         ULARGE_INTEGER now = FT2ULL(ftSystem);
 
-        // --- 后台进程清理逻辑 (带诊断日志) ---
-        if (settings.cpuSetResetInterval > 0 && pSetThreadSelectedCpuSets)
+        // --- 1. 优先更新当前前台进程的时间戳 ---
+        if (currentPid != 0)
+        {
+            std::lock_guard<std::mutex> lock(g_statsMutex);
+            // 如果缓存中还没有这个进程，这里不会插入，会在下面的优化逻辑中插入
+            // 但如果有了，必须立即更新，防止被误杀
+            if (g_processStatsCache.count(currentPid)) {
+                g_processStatsCache[currentPid].lastForegroundTime = now;
+            }
+        }
+
+        // --- 2. 后台进程清理逻辑 ---
+        // 移除 pSetThreadSelectedCpuSets 检查，即使 API 不存在也输出日志以便调试
+        if (settings.cpuSetResetInterval > 0)
         {
             std::lock_guard<std::mutex> lock(g_statsMutex);
             ULONGLONG resetThreshold = (ULONGLONG)settings.cpuSetResetInterval * 10000000ULL;
+
+            // [调试] 每5秒输出一次缓存状态
+            if (++debugLogCounter % 5 == 0) {
+                LogColor(COLOR_DEFAULT, "[调试] 正在检查后台清理... 缓存进程数: %zu, 当前前台: %lu\n", g_processStatsCache.size(), currentPid);
+            }
 
             for (auto& procPair : g_processStatsCache)
             {
                 DWORD pid = procPair.first;
                 ProcessStats& pStats = procPair.second;
 
-                // 1. 如果是当前前台进程，更新时间戳并跳过
-                if (pid == currentPid)
-                {
-                    pStats.lastForegroundTime = now;
-                    continue; 
-                }
+                // 跳过当前前台进程
+                if (pid == currentPid) continue;
 
-                // 2. 初始化时间戳 (防止新进程为0)
-                if (pStats.lastForegroundTime.QuadPart == 0)
-                {
+                // 初始化时间戳
+                if (pStats.lastForegroundTime.QuadPart == 0) {
                     pStats.lastForegroundTime = now;
                     continue;
                 }
 
-                // 3. 检查后台超时
+                // 计算后台时间
                 if (now.QuadPart > pStats.lastForegroundTime.QuadPart)
                 {
                     ULONGLONG timeInBg = now.QuadPart - pStats.lastForegroundTime.QuadPart;
+                    double secondsInBg = (double)timeInBg / 10000000.0;
+
+                    // [调试] 如果后台时间超过阈值的一半，打印日志观察
                     
+                    if (secondsInBg > (settings.cpuSetResetInterval / 2.0)) {
+                        LogColor(COLOR_DEFAULT, "[调试] 进程 %lu 已后台 %.1f 秒 (阈值 %d)\n", pid, secondsInBg, settings.cpuSetResetInterval);
+                    }
+                    
+
                     if (timeInBg > resetThreshold)
                     {
-                        // 触发超时，先输出诊断信息
-                        LogColor(COLOR_INFO, "[诊断] 进程 %lu 已后台 %llu 秒 (阈值 %d)，正在检查线程状态...\n", pid, timeInBg / 10000000, settings.cpuSetResetInterval);
+                        if (!pSetThreadSelectedCpuSets) {
+                            LogColor(COLOR_ERROR, "[错误] 触发清理但 API 不可用。\n");
+                            continue;
+                        }
 
                         bool triggeredReset = false;
                         int resetCount = 0;
+                        int threadsChecked = 0;
 
                         for (auto& threadPair : pStats.threads)
                         {
                             ThreadStats& tStats = threadPair.second;
+                            threadsChecked++;
                             
                             if (tStats.hasCpuSets)
                             {
@@ -956,15 +986,15 @@ void ThreadOptimizerThread()
                                 HANDLE hThread = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_SET_INFORMATION, FALSE, tStats.threadId);
                                 if (hThread)
                                 {
-                                    // 清空 CPU Sets 和 理想核心
                                     BOOL b1 = pSetThreadSelectedCpuSets(hThread, NULL, 0);
-                                    DWORD d2 = SetThreadIdealProcessor(hThread, MAXIMUM_PROCESSORS);
-                                    
+                                    SetThreadIdealProcessor(hThread, MAXIMUM_PROCESSORS);
                                     if (b1) resetCount++;
                                     CloseHandle(hThread);
                                 }
+                                else {
+                                    LogColor(COLOR_WARNING, "[警告] 无法打开线程 %lu 进行重置。\n", tStats.threadId);
+                                }
                                 
-                                // 清除标记
                                 tStats.hasCpuSets = false;
                                 tStats.assignedCpuSetId = 0;
                             }
@@ -972,16 +1002,17 @@ void ThreadOptimizerThread()
 
                         if (triggeredReset)
                         {
-                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 已在后台超过 %d 秒，已重置 %d 个线程的 CPU Sets。\n", 
-                                pid, settings.cpuSetResetInterval, resetCount);
+                            LogColor(COLOR_WARNING, "[清理] 进程 %lu 已在后台 %.1f 秒，重置了 %d 个线程 (共扫描 %d 个)。\n", 
+                                pid, secondsInBg, resetCount, threadsChecked);
                         }
                         else
                         {
-                            // 如果没有线程需要重置，也记录一下，证明逻辑跑通了
-                            LogColor(COLOR_DEFAULT, "  -> [诊断] 进程 %lu 无需重置 (未设置 CPU Sets)。\n", pid);
+                            // [关键] 即使没有线程被重置，也输出日志，证明逻辑到了这里
+                            // 这说明进程超时了，但没有线程被标记为 hasCpuSets
+                             LogColor(COLOR_INFO, "[诊断] 进程 %lu 已后台 %.1f 秒，但没有标记为 hasCpuSets 的线程。\n", pid, secondsInBg);
                         }
 
-                        // 更新时间戳，避免下一秒重复检查
+                        // 更新时间戳，避免刷屏
                         pStats.lastForegroundTime = now; 
                     }
                 }
@@ -1048,7 +1079,7 @@ void ThreadOptimizerThread()
             ProcessStats& procStats = g_processStatsCache[currentPid];
             procStats.processId = currentPid;
             
-            // 再次更新前台时间 (双重保险)
+            // 再次更新前台时间
             procStats.lastForegroundTime = now;
 
             // --- 检测前台切换 ---

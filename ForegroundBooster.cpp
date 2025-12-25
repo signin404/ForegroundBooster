@@ -785,7 +785,54 @@ ULONG GetCpuSetIdFromLogicalIndex(DWORD logicalIndex, GetSystemCpuSetInformation
     return 0; // 未找到
 }
 
-// --- 新增：底层线程信息定义 (用于获取线程亲和性) ---
+// --- 补充 NTAPI 缺失的定义 ---
+
+// 1. 定义 CLIENT_ID
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID;
+
+// 2. 定义 THREADINFOCLASS 枚举
+typedef enum _THREADINFOCLASS {
+    ThreadBasicInformation = 0,
+    ThreadTimes,
+    ThreadPriority,
+    ThreadBasePriority,
+    ThreadAffinityMask,
+    ThreadImpersonationToken,
+    ThreadDescriptorTableEntry,
+    ThreadEnableAlignmentFaultFixup,
+    ThreadEventPair_Reusable,
+    ThreadQuerySetWin32StartAddress,
+    ThreadZeroTlsCell,
+    ThreadPerformanceCount,
+    ThreadAmILastThread,
+    ThreadIdealProcessor,
+    ThreadPriorityBoost,
+    ThreadSetTlsArrayAddress,
+    ThreadIsIoPending,
+    ThreadHideFromDebugger,
+    ThreadBreakOnTermination,
+    ThreadSwitchLegacyState,
+    ThreadIsTerminated,
+    ThreadLastSystemCall,
+    ThreadIoPriority,
+    ThreadCycleTime,
+    ThreadPagePriority,
+    ThreadActualBasePriority,
+    ThreadTebInformation,
+    ThreadCSwitchMon,
+    ThreadCSwitchPmu,
+    ThreadWow64Context,
+    ThreadGroupInformation,
+    ThreadUmsInformation,
+    ThreadCounterProfiling,
+    ThreadIdealProcessorEx,
+    MaxThreadInfoClass
+} THREADINFOCLASS;
+
+// 3. 定义 THREAD_BASIC_INFORMATION (现在 CLIENT_ID 已定义，不会报错了)
 typedef struct _THREAD_BASIC_INFORMATION {
     NTSTATUS ExitStatus;
     PVOID TebBaseAddress;
@@ -795,6 +842,7 @@ typedef struct _THREAD_BASIC_INFORMATION {
     LONG BasePriority;
 } THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
 
+// 4. 定义函数指针 (现在 THREADINFOCLASS 已定义，不会报错了)
 using NtQueryInformationThreadPtr = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 
 void ThreadOptimizerThread()

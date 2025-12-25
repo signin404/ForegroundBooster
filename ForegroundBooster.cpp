@@ -994,7 +994,10 @@ void ThreadOptimizerThread()
 
         // 3. 决策逻辑
         {
-            std::lock_guard<std::mutex> lock(g_statsMutex);
+            // --- 修正点：使用 std::unique_lock 以支持手动 unlock/lock ---
+            std::unique_lock<std::mutex> lock(g_statsMutex);
+            // -------------------------------------------------------
+
             ProcessStats& procStats = g_processStatsCache[currentPid];
             procStats.processId = currentPid;
             procStats.lastForegroundTime = now;
@@ -1014,9 +1017,10 @@ void ThreadOptimizerThread()
                 ULONGLONG intervalUnits = (ULONGLONG)settings.cpuSetInterval * 10000000ULL;
                 if (timeSinceLastOpt >= intervalUnits) {
                     // 再次检查限制 (防止中途修改)
-                    lock.unlock();
+                    lock.unlock(); // 临时解锁
                     bool restricted = CheckProcessRestrictions(currentPid);
-                    lock.lock();
+                    lock.lock();   // 重新加锁
+
                     if (restricted) continue;
 
                     LogColor(COLOR_INFO, "[分析] 观察周期结束 执行采样与计算...\n");
@@ -1138,7 +1142,7 @@ void ThreadOptimizerThread()
                             EnsureCoreInAffinity(hHeavy, settings.idealCore);
                             ULONG cpuSetIds[] = { idealCoreCpuSetId };
                             if (pSetThreadSelectedCpuSets(hHeavy, cpuSetIds, 1)) {
-                                LogColor(COLOR_SUCCESS, "  -> [优化] 线程 %lu (重负载) 绑定 CPU Set ID: %lu\n", pHeavyThread->threadId, idealCoreCpuSetId);
+                                LogColor(COLOR_SUCCESS, "  -> [优化] 重负载线程 %lu 绑定 CPU Set ID: %lu\n", pHeavyThread->threadId, idealCoreCpuSetId);
                                 pHeavyThread->hasCpuSets = true; pHeavyThread->assignedCpuSetId = idealCoreCpuSetId;
                             }
                             CloseHandle(hHeavy);

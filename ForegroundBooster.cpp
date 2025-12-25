@@ -1286,14 +1286,25 @@ void ThreadOptimizerThread()
                             {
                                 LogColor(COLOR_INFO, "  -> [其余线程] 正在为 %zu 个线程分配理想核心 (队列长度: %zu)...\n", otherThreads.size(), allocationQueue.size());
 
+                                int successCount = 0;
                                 for (size_t i = 0; i < otherThreads.size(); ++i) {
-                                    DWORD targetCore = allocationQueue[i % allocationQueue.size()];
-                                    HANDLE hThread = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, otherThreads[i]->threadId);
+                                    DWORD targetCore = allocationQueue[i % allocationQueue.size()]; // 循环分配
+
+                                    // --- 修正点：必须使用 THREAD_SET_INFORMATION 权限 ---
+                                    HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, otherThreads[i]->threadId);
                                     if (hThread) {
-                                        SetThreadIdealProcessor(hThread, targetCore);
+                                        if (SetThreadIdealProcessor(hThread, targetCore) != (DWORD)-1) {
+                                            successCount++;
+                                            // 调试日志 (可选 取消注释以查看详细分配)
+                                             LogColor(COLOR_DEFAULT, "     Thread %lu -> Core %d\n", otherThreads[i]->threadId, targetCore);
+                                        } else {
+                                            // 如果失败 尝试记录错误 (通常是权限不足或线程已退出)
+                                             LogColor(COLOR_ERROR, "     Failed to set ideal processor for thread %lu. Error: %lu\n", otherThreads[i]->threadId, GetLastError());
+                                        }
                                         CloseHandle(hThread);
                                     }
                                 }
+                                LogColor(COLOR_SUCCESS, "     -> 成功设置 %d / %zu 个线程的理想核心\n", successCount, otherThreads.size());
                             }
                         }
                     }
